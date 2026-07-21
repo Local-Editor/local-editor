@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Local Editor — Transcript Editor</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="wide">
+<header>
+  <h1>🎬 Local Editor</h1>
+  <nav><a href="/">Record</a><a href="editor.html" class="active">Edit</a><a href="renders.html">Renders</a></nav>
+</header>
+
+<main>
+  <section id="picker" class="panel">
+    <h2>Pick a recording</h2>
+    <div id="sessionList" class="session-list">Loading…</div>
+  </section>
+
+  <section id="editor" class="panel hidden">
+    <h2 id="sessTitle"></h2>
+    <div class="editor-grid">
+      <div>
+        <div id="playerStage" class="player-stage">
+          <video id="player" controls></video>
+          <div id="camOverlay" class="cam-overlay hidden">
+            <video id="camVideo" playsinline></video>
+          </div>
+          <video id="insertPlayer" class="insert-player hidden" playsinline></video>
+          <div id="gapCover" class="gap-cover hidden"></div>
+          <div id="insertBadge" class="insert-badge hidden">▶ insert</div>
+        </div>
+        <div class="stat-bar">
+          <span>Original <b id="statOrig">–</b></span>
+          <span>After cuts <b id="statClean">–</b></span>
+          <span>Removed <b id="statRemoved">–</b></span>
+        </div>
+        <div class="controls-row">
+          <label class="toggle"><input type="checkbox" id="skipRemoved" checked> Skip cut sections during playback</label>
+        </div>
+        <div class="controls-row">
+          <button id="aiCleanBtn" class="btn">✨ AI clean-up</button>
+          <button id="saveBtn" class="btn btn-secondary">Save transcript</button>
+          <button id="undoAllBtn" class="btn btn-secondary">Restore all cuts</button>
+        </div>
+        <div class="controls-row">
+          <label>Format
+            <select id="renderFormat">
+              <option value="wide" selected>Original 16:9</option>
+              <option value="short|cam-top">Short 9:16 — webcam top, screen bottom</option>
+              <option value="short|cam-bottom">Short 9:16 — screen top, webcam bottom</option>
+              <option value="short|overlay">Short 9:16 — screen full + webcam bubble</option>
+              <option value="square|cam-top">Square 1:1 — webcam top, screen bottom</option>
+            </select>
+          </label>
+          <label>Quality
+            <select id="renderQuality">
+              <option value="high">High</option>
+              <option value="balanced" selected>Balanced</option>
+              <option value="small">Small file</option>
+            </select>
+          </label>
+          <button id="renderBtn" class="btn">Render clean video</button>
+        </div>
+        <div class="controls-row">
+          <label>🎵 Background music
+            <select id="musicSelect"><option value="">— none —</option></select>
+          </label>
+          <label>Level
+            <select id="musicGain">
+              <option value="-24">Subtle</option>
+              <option value="-21" selected>Normal</option>
+              <option value="-17">Present</option>
+            </select>
+          </label>
+          <button id="musicBtn" class="btn btn-secondary" disabled>Add music</button>
+          <a id="dlMusic" class="btn btn-secondary hidden" download>Download scored video</a>
+        </div>
+        <div class="controls-row">
+          <a id="dlTxt" class="btn btn-secondary" download>Export .txt</a>
+          <a id="dlSrt" class="btn btn-secondary" download>Export .srt</a>
+          <a id="dlClean" class="btn btn-secondary hidden" download>Download clean.mp4</a>
+        </div>
+        <div id="jobProgress" class="job-progress hidden">
+          <div class="progress-row">
+            <div class="progress-track"><div id="progressFill"></div></div>
+            <span id="progressText" class="hint"></span>
+          </div>
+          <details>
+            <summary class="hint">show details</summary>
+            <pre id="jobLog" class="job-log"></pre>
+          </details>
+        </div>
+      </div>
+      <div>
+        <p class="hint">Click a word to jump there · <b>click + click</b> a word to cut/restore it ·
+        double-click to edit the text · orange chips are long pauses (click to keep them).</p>
+        <div class="controls-row search-row">
+          <input id="searchBox" type="search" placeholder="🔍 Search words or phrases… (Enter = jump to next)">
+          <span id="searchCount" class="hint"></span>
+          <button id="cutMatchesBtn" class="btn btn-danger" disabled>Cut all matches</button>
+          <button id="restoreMatchesBtn" class="btn btn-secondary" disabled>Restore matches</button>
+        </div>
+        <div id="transcript" class="transcript">Loading transcript…</div>
+        <div class="controls-row">
+          <button id="copyTranscriptBtn" class="btn btn-secondary">📋 Copy transcript</button>
+          <label class="toggle"><input type="checkbox" id="copyKeptOnly" checked> Only kept words (skip cuts)</label>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="timelineBar" class="timeline-bar hidden">
+  <div class="timeline-head">
+    <span id="tlTime" class="hint">0:00 / 0:00</span>
+    <span class="tl-zoom">
+      <button id="tlZoomOut" class="btn btn-secondary tl-btn" title="Zoom out (or scroll wheel)">−</button>
+      <button id="tlZoomIn" class="btn btn-secondary tl-btn" title="Zoom in (or scroll wheel)">+</button>
+      <button id="tlZoomFit" class="btn btn-secondary tl-btn" title="Show the whole recording">Fit</button>
+      <button id="tlExpandAll" class="btn btn-secondary tl-btn" title="Expand / collapse all timelines">⤢ All</button>
+      <button id="tlScissor" class="btn btn-secondary tl-btn" title="Split the footage at the playhead — pieces can then be dragged along the timeline">✂</button>
+      <button id="tlSnap" class="btn btn-secondary tl-btn" title="Snap clip edges to other clips and word boundaries while dragging/trimming">🧲 Snap</button>
+      <span id="tlZoomLabel" class="hint"></span>
+    </span>
+    <span id="tlToast" class="tl-toast"></span>
+    <span class="hint">click = jump/select · <b>drag a block = move it</b> · <b>⇧-drag = select a range to cut</b> (on the blue timeline) · ✂ = split · wheel = zoom</span>
+  </div>
+  <canvas id="timeline"></canvas>
+  <input type="range" id="tlPan" min="0" max="0" step="0.1" value="0" title="Pan across the recording">
+
+  <div id="tlActions" class="tl-actions hidden">
+    <button id="tlCutBtn" class="btn btn-danger">✂ Cut range</button>
+    <button id="tlCancelBtn" class="btn btn-secondary">Cancel</button>
+  </div>
+
+  <div id="tlContext" class="tl-context hidden">
+    <button class="mi" id="ctxRecordInsert">⏺ Record insert here</button>
+    <button class="mi" id="ctxFileInsert">🎞 Insert video / audio file…</button>
+    <button class="mi" id="ctxFromEdit">📼 Add from another edit…</button>
+    <button class="mi hidden" id="ctxOpenInsert">▶ Open insert</button>
+    <button class="mi danger hidden" id="ctxRemoveInsert">✕ Remove insert</button>
+    <button class="mi danger hidden" id="ctxRemoveCamKf">📷 Reset webcam for this piece</button>
+    <button class="mi hidden" id="ctxClearCamKf">📷 Clear all webcam placements</button>
+    <button class="mi" id="ctxAddTrack">➕ Add timeline</button>
+    <button class="mi danger hidden" id="ctxRemoveTrack">➖ Remove this timeline</button>
+  </div>
+  <div id="editPicker" class="tl-context hidden"></div>
+  <input type="file" id="insertFile" class="hidden"
+         accept="video/mp4,video/webm,video/quicktime,audio/mpeg,audio/wav,audio/x-m4a,audio/mp4">
+</div>
+
+<div id="txContext" class="tl-context hidden">
+  <button class="mi" id="txCut">✂ Cut selection</button>
+  <button class="mi" id="txRestore">↩ Restore selection</button>
+  <button class="mi" id="txNewSession">🎬 New edit session from selection</button>
+  <button class="mi" id="txRenderPart">⚡ Render only this part</button>
+</div>
+
+<script src="editor.js"></script>
+</body>
+</html>

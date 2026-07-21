@@ -1,0 +1,13 @@
+# python venv (recreate with: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt)
+.venv/
+
+# your recordings and renders — personal data, never committed
+recordings/
+
+# music library — fetch with: .venv/bin/python3 scripts/music.py starter
+music/
+
+# misc
+node_modules/
+.DS_Store
+*.log

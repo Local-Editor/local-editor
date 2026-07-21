@@ -1,0 +1,13 @@
+{
+  "name": "local-editor",
+  "version": "1.0.0",
+  "description": "Fully-local screen/webcam recorder + transcript-driven video editor. No cloud, no accounts.",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server.js",
+    "studio": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

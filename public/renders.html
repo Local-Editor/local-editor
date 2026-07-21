@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Local Editor — Renders</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="wide">
+<header>
+  <h1>🎬 Local Editor</h1>
+  <nav><a href="/">Record</a><a href="editor.html">Edit</a><a href="renders.html" class="active">Renders</a></nav>
+</header>
+
+<main>
+  <div id="renderList" class="render-grid">Loading…</div>
+</main>
+
+<script>
+const KIND_LABELS = {
+  clean: { label: 'Clean render', hint: 'cuts + clean-up applied', cls: 'kind-clean' },
+  music: { label: 'With music', hint: 'clean render + background track', cls: 'kind-music' },
+  composite: { label: 'Full composite', hint: 'screen + webcam, uncut', cls: 'kind-composite' },
+};
+
+function fmtSize(b) {
+  return b > 1e9 ? (b / 1e9).toFixed(2) + ' GB' : Math.round(b / 1e6) + ' MB';
+}
+function fmtDate(ms) {
+  return new Date(ms).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+const slug = s => s.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || 'render';
+const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+
+async function rename(session, patch) {
+  await fetch(`/api/meta?session=${encodeURIComponent(session)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  load();
+}
+
+async function load() {
+  const renders = await (await fetch('/api/renders')).json();
+  const el = document.getElementById('renderList');
+  if (!renders.length) {
+    el.innerHTML = '<p class="hint">No renders yet — make a recording, edit it, and hit “Render clean video”.</p>';
+    return;
+  }
+  el.innerHTML = renders.map((r, i) => {
+    const k = KIND_LABELS[r.kind] || { label: r.kind, hint: '', cls: '' };
+    const url = `/recordings/${encodeURIComponent(r.session)}/${encodeURIComponent(r.file)}`;
+    const shown = r.label || `${r.title} — ${k.label}`;
+    const dlName = slug(r.label || `${r.title}-${r.kind}`) + '.mp4';
+    return `
+    <div class="render-card" data-i="${i}">
+      <video src="${url}" controls preload="metadata"></video>
+      <div class="render-meta">
+        <div class="card-menu">
+          <button class="menu-btn" data-i="${i}" title="Options">⋮</button>
+          <div class="menu hidden">
+            <button class="mi mi-rename" data-i="${i}">Rename render</button>
+            <button class="mi mi-delete" data-i="${i}">Delete render</button>
+          </div>
+        </div>
+        <span class="kind-badge ${k.cls}" title="${k.hint}">${k.label}</span>
+        <b class="rename-render" data-i="${i}" title="Double-click to rename this render">${esc(shown)}</b>
+        <span class="hint">recording: <span class="rename-session" data-i="${i}" title="Double-click to rename the recording">${esc(r.title)}</span>
+          · ${esc(r.file)} · ${fmtSize(r.size)} · ${fmtDate(r.mtime)}</span>
+        ${r.credits ? `<details><summary class="hint">music credit (paste into your description)</summary><pre class="credits">${esc(r.credits.trim())}</pre></details>` : ''}
+        <div class="controls-row">
+          <a class="btn" href="${url}" download="${esc(dlName)}">⬇ Download ${esc(dlName)}</a>
+          <a class="btn btn-secondary" href="editor.html?session=${encodeURIComponent(r.session)}">Open in editor</a>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+
+  el.querySelectorAll('.menu-btn').forEach(n => n.onclick = e => {
+    e.stopPropagation();
+    const menu = n.nextElementSibling;
+    const wasHidden = menu.classList.contains('hidden');
+    document.querySelectorAll('.card-menu .menu').forEach(m => m.classList.add('hidden'));
+    if (wasHidden) menu.classList.remove('hidden');
+  });
+  if (!window.menuDismissBound) {
+    window.menuDismissBound = true;   // bind once, not per load() — {once:true} died after the first click
+    document.addEventListener('click', () =>
+      document.querySelectorAll('.card-menu .menu').forEach(m => m.classList.add('hidden')));
+  }
+
+  el.querySelectorAll('.mi-rename').forEach(n => n.onclick = () => {
+    const r = renders[+n.dataset.i];
+    const name = prompt('Name this render:', r.label || `${r.title} — ${(KIND_LABELS[r.kind]||{label:r.kind}).label}`);
+    if (name && name.trim()) rename(r.session, { renderNames: { [r.file]: name.trim() } });
+  });
+  el.querySelectorAll('.mi-delete').forEach(n => n.onclick = async e => {
+    e.stopPropagation();
+    const r = renders[+n.dataset.i];
+    // two-step inline confirm — no native dialog
+    if (!n.dataset.armed) {
+      n.dataset.armed = '1';
+      n.textContent = 'Really delete? Click again';
+      n.classList.add('danger');
+      setTimeout(() => { n.dataset.armed = ''; n.textContent = 'Delete render'; n.classList.remove('danger'); }, 4000);
+      return;
+    }
+    await fetch(`/api/render?session=${encodeURIComponent(r.session)}&file=${encodeURIComponent(r.file)}`,
+      { method: 'DELETE' });
+    load();
+  });
+
+  el.querySelectorAll('.rename-render').forEach(n => n.ondblclick = () => {
+    const r = renders[+n.dataset.i];
+    const name = prompt('Name this render:', r.label || `${r.title} — ${(KIND_LABELS[r.kind]||{label:r.kind}).label}`);
+    if (name && name.trim()) rename(r.session, { renderNames: { [r.file]: name.trim() } });
+  });
+  el.querySelectorAll('.rename-session').forEach(n => n.ondblclick = () => {
+    const r = renders[+n.dataset.i];
+    const name = prompt('Rename this recording (applies everywhere):', r.title);
+    if (name && name.trim()) rename(r.session, { title: name.trim() });
+  });
+}
+load();
+</script>
+</body>
+</html>

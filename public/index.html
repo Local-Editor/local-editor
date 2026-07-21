@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Local Editor — Record</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>🎬 Local Editor</h1>
+  <nav><a href="/" class="active">Record</a><a href="editor.html">Edit</a><a href="renders.html">Renders</a></nav>
+</header>
+
+<main>
+  <section id="setup" class="panel">
+    <div class="controls-row">
+      <button id="pickScreen" class="btn">🎥+🖥 Webcam and screen</button>
+      <button id="screenOnly" class="btn btn-secondary">🖥 Screen only</button>
+      <button id="webcamOnly" class="btn btn-secondary">🎥 Webcam only</button>
+      <label class="toggle"><input type="checkbox" id="useWebcam" checked> Webcam overlay</label>
+      <select id="camSelect" title="Camera"></select>
+      <select id="micSelect" title="Microphone"></select>
+      <label class="toggle"><input type="checkbox" id="sysAudio" checked> Capture system/tab audio</label>
+    </div>
+
+    <div id="stage" class="stage">
+      <video id="screenPreview" autoplay muted playsinline></video>
+      <div id="previewCover" class="preview-cover hidden">
+        <div>
+          <b>🖥 Recording this screen</b><br>
+          Live preview hidden to avoid the infinity-mirror effect.<br>
+          <span class="hint">Your webcam bubble below still shows exactly where it will sit.</span>
+        </div>
+      </div>
+      <div id="camBox" class="cam-box hidden">
+        <video id="camPreview" autoplay muted playsinline></video>
+        <div class="cam-handle" id="camHandle"></div>
+      </div>
+      <div id="stageHint">Choose a screen or window to see the preview here</div>
+      <div id="countdown" class="countdown hidden"></div>
+    </div>
+
+    <div class="controls-row">
+      <label>Webcam shape
+        <select id="camShape">
+          <option value="1">Square (1:1)</option>
+          <option value="1.333">Rectangle (4:3)</option>
+          <option value="1.778">Rectangle (16:9)</option>
+        </select>
+      </label>
+      <label>Corner radius <input type="range" id="camRadius" min="0" max="50" value="12"> <span id="radiusVal">12%</span></label>
+      <label class="toggle"><input type="checkbox" id="camMirror" checked> Mirror webcam</label>
+      <span class="hint">Drag the webcam to move it · drag any edge or corner to resize</span>
+    </div>
+
+    <div class="controls-row record-row">
+      <button id="recordBtn" class="btn btn-record" disabled>● Record</button>
+      <span id="timer" class="timer">00:00</span>
+      <span id="status" class="status"></span>
+    </div>
+  </section>
+
+  <section id="done" class="panel hidden">
+    <h2>Recording saved ✔</h2>
+    <p>Both files were saved <strong>individually</strong> under <code id="savedPath"></code>:</p>
+    <ul>
+      <li><code>screen.webm</code> — the screen recording</li>
+      <li><code>webcam.webm</code> — the webcam + mic recording</li>
+      <li><code>layout.json</code> — webcam overlay position/size (as you arranged it)</li>
+    </ul>
+    <div class="controls-row">
+      <button id="processBtn" class="btn">Composite + transcribe →</button>
+      <a id="editLink" class="btn btn-secondary">Open in editor</a>
+      <button id="againBtn" class="btn btn-secondary">Record another</button>
+    </div>
+    <pre id="jobLog" class="job-log hidden"></pre>
+  </section>
+</main>
+
+<script src="recorder.js"></script>
+</body>
+</html>
