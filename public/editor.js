@@ -776,6 +776,14 @@ function tlDur() {
 function tlView() {
   const dur = tlDur();
   if (!tl.view) return { start: 0, len: dur };
+  // cuts/trims/deletes can shrink the timeline underneath a zoomed view,
+  // which would leave the canvas showing empty space — clamp to what exists
+  if (tl.view.start + tl.view.len > dur + 0.01) {
+    const len = Math.min(tl.view.len, dur);
+    const start = Math.max(0, Math.min(dur - len, tl.view.start));
+    tl.view = len >= dur - 0.01 ? null : { start, len };
+    if (!tl.view) return { start: 0, len: dur };
+  }
   return tl.view;
 }
 
@@ -1125,14 +1133,24 @@ function tlSetup() {
 
   c.addEventListener('pointerup', async e => {
     if (tl.trimDrag) {
-      const { moved } = tl.trimDrag;
+      const d = tl.trimDrag;
       tl.trimDrag = null;
       tl.snapAt = null;
       tl.static = null;
-      if (moved) {
+      if (d.moved) {
         normalizeTimeline();
+        let note = '';
+        if (d.kind === 'seg') {
+          // a footage trim removes content from the arrangement — keep the
+          // transcript honest about it, and be loud about big trims
+          syncWordsToArrangement();
+          renderTranscript();
+          const delta = (d.s1 - d.s0) - segLen(d.sg);
+          note = delta > 0.05 ? ` — ${fmtSec(delta)} trimmed off` :
+                 delta < -0.05 ? ` — ${fmtSec(-delta)} extended` : '';
+        }
         markDirty(); await saveTranscript(); updateStats();
-        tlToast('trimmed — edges snap to clips & word boundaries (toggle with the Snap button)');
+        tlToast(`✂ trimmed${note} — ⌘Z to undo`);
       }
       return;
     }
