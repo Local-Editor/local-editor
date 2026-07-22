@@ -75,7 +75,10 @@ Left = video preview + controls. Right = the **transcript**. Bottom = the
 - **✂ scissor** splits footage at the playhead; drag pieces to rearrange
   (gaps render as black; drag before the start to extend the front).
 - Right-click: **record an insert here**, **insert a video/audio file**,
-  **📼 add from another edit**, add/remove timelines.
+  **📼 add from another edit**, **🗑 delete a footage piece** (after a
+  scissor split), add/remove timelines.
+- **⌘Z / ⇧⌘Z** (Ctrl on Windows/Linux) undo / redo any edit — word cuts,
+  range cuts, splits, moves, trims, deletes.
 - **Inserts are overlays** — they play *on top* of the footage; drag/resize
   them in the preview to frame them anywhere.
 - **Drag a block = move · ⇧-drag = select a range to cut · drag a block's

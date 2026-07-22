@@ -98,6 +98,7 @@ async function openSession() {
   tr = await res.json();
   tr.settings = tr.settings || { padSec: 0.12, maxGapSec: 1.0 };
   migrateCamKeyframes();
+  histReset();   // undo baseline = the transcript as loaded
   renderTranscript();
   updateStats();
   tlSetup();
@@ -469,7 +470,47 @@ function updateStats() {
 }
 
 // ---------- actions ----------
-function markDirty() { dirty = true; $('saveBtn').textContent = 'Save transcript *'; }
+function markDirty() { dirty = true; $('saveBtn').textContent = 'Save transcript *'; histPush(); }
+
+// ---------- undo / redo (⌘Z / ⇧⌘Z) ----------
+// Every committed edit calls markDirty() after mutating `tr`, so the history
+// is a stack of post-edit snapshots; undo walks back to the previous one.
+const hist = { stack: [], idx: -1, max: 100, muted: false };
+
+function histPush() {
+  if (!tr || hist.muted) return;
+  const snap = JSON.stringify(tr);
+  if (hist.stack[hist.idx] === snap) return;   // no actual change
+  hist.stack.length = hist.idx + 1;            // an edit invalidates the redo tail
+  hist.stack.push(snap);
+  if (hist.stack.length > hist.max) hist.stack.shift();
+  hist.idx = hist.stack.length - 1;
+}
+
+function histReset() {
+  hist.stack = tr ? [JSON.stringify(tr)] : [];
+  hist.idx = hist.stack.length - 1;
+}
+
+async function histGo(dir) {
+  const to = hist.idx + dir;
+  if (to < 0 || to >= hist.stack.length) {
+    tlToast(dir < 0 ? 'nothing to undo' : 'nothing to redo');
+    return;
+  }
+  hist.idx = to;
+  hist.muted = true;   // the re-render below calls markDirty paths — don't re-record
+  try {
+    tr = JSON.parse(hist.stack[to]);
+    dirty = true; $('saveBtn').textContent = 'Save transcript *';
+    renderTranscript(); updateStats(); tl.static = null;
+    await saveTranscript();
+  } finally {
+    hist.muted = false;
+  }
+  const left = dir < 0 ? hist.idx : hist.stack.length - 1 - hist.idx;
+  tlToast(dir < 0 ? `↩ undone (${left} more undo${left === 1 ? '' : 's'} available)` : '↪ redone');
+}
 
 $('saveBtn').onclick = saveTranscript;
 async function saveTranscript() {
@@ -494,6 +535,7 @@ async function saveTranscript() {
     }
     tr = fresh;
     tr.settings = tr.settings || { padSec: 0.12, maxGapSec: 1.0 };
+    histReset();   // old snapshots carry the old generatedAt — saving them would 409
     renderTranscript(); updateStats();
     await saveTranscript();
     alert(`The transcript was re-generated with a better model while you were editing.\nYour cuts (${carried} words) were carried over onto the new transcript automatically.`);
@@ -510,6 +552,7 @@ $('aiCleanBtn').onclick = async () => {
     await runJob('enhance');
     const res = await fetch(`/api/transcript?session=${sessionId}`);
     tr = await res.json();
+    histPush();   // AI clean-up lands in the undo history like any other edit
     renderTranscript(); updateStats();
   } finally {
     $('aiCleanBtn').disabled = false;
@@ -1256,34 +1299,52 @@ $('tlCutBtn').onclick = () => {
     return;
   }
 
-  const keepBefore = keepSegments().reduce((s, [x, y]) => s + (y - x), 0);
-  // selection is on the timeline — map back to source times (gap-safe)
-  const locA = locate(tl.sel[0]), locB = locate(tl.sel[1]);
-  const a = Math.round(((locA.t ?? locA.next?.s0 ?? 0)) * 1000) / 1000;
-  const b = Math.round(((locB.t ?? (locB.next ? locB.next.s0 : tr.duration))) * 1000) / 1000;
-  if (b - a < 0.05) {
-    tlToast('nothing to cut in that stretch of the timeline');
-    tl.sel = null; $('tlActions').classList.add('hidden');
-    return;
+  // main track: cut the selected TIMELINE span out of the arrangement —
+  // trim/split/remove the pieces it touches, then ripple-close the hole.
+  // The cut is piece-local, NOT a global source-time cut: when the same
+  // source material appears in more than one piece (a duplicated or
+  // trimmed-out copy), cutting it here must not delete it everywhere.
+  const [c0, c1] = tl.sel;
+  const cutLen = c1 - c0;
+  tl.sel = null; $('tlActions').classList.add('hidden');
+  if (cutLen < 0.05) { tlToast('nothing to cut in that stretch of the timeline'); return; }
+
+  tr.segments = segs();   // materialize + sort
+  const out = [];
+  for (const sg of tr.segments) {
+    const p0 = sg.pos, p1 = sg.pos + segLen(sg);
+    if (p1 <= c0 + 1e-6 || p0 >= c1 - 1e-6) { out.push(sg); continue; }  // untouched
+    if (p0 < c0)   // the part before the selection survives
+      out.push({ ...sg, s1: sg.s0 + (c0 - p0) });
+    if (p1 > c1)   // the part after survives (new id if the head also survived)
+      out.push({ ...sg, id: p0 < c0 ? `seg${Date.now().toString(36)}-${out.length}` : sg.id,
+                 s0: sg.s0 + (c1 - p0), pos: c1 });
   }
-  tr.cutRanges = tr.cutRanges || [];
-  tr.cutRanges.push([a, b]);
-  // words inside the range are cut too, so transcript & timeline agree
+  if (!out.length) { tlToast("that would cut the entire timeline — delete pieces individually instead"); return; }
+
+  // ripple: everything at/after the cut moves left to close the hole
+  for (const sg of out) if (sg.pos >= c1 - 1e-6) sg.pos = Math.round((sg.pos - cutLen) * 1000) / 1000;
+  for (const ins of (tr.inserts || [])) {
+    if (ins.at >= c1 - 1e-6) ins.at = Math.round((ins.at - cutLen) * 100) / 100;
+    else if (ins.at > c0) ins.at = Math.round(c0 * 100) / 100;   // started inside the cut: lands at the seam
+  }
+  tr.segments = out;
+  syncWordsToArrangement();
+  markDirty(); saveTranscript(); renderTranscript(); updateStats(); tl.static = null; tlRedrawStatic();
+  tlToast(`✂ removed ${fmtSec(cutLen)} from the timeline — ⌘Z to undo`);
+};
+
+// strike words whose source time no longer appears in ANY piece, so the
+// transcript mirrors the timeline; never un-removes existing cuts
+function syncWordsToArrangement() {
+  const ss = segs();
   tr.words.forEach(w => {
-    if (w.start >= a - 0.05 && w.end <= b + 0.05 && !w.removed) {
+    const mid = (w.start + w.end) / 2;
+    if (!w.removed && !ss.some(sg => mid >= sg.s0 - 0.05 && mid <= sg.s1 + 0.05)) {
       w.removed = true; w.reason = 'manual';
     }
   });
-  tl.sel = null;
-  $('tlActions').classList.add('hidden');
-  markDirty(); renderTranscript(); updateStats(); tlRedrawStatic();
-  // explain what the cut actually changed — silence/gaps may already have
-  // been auto-trimmed, which makes the stats look unmoved
-  const delta = keepBefore - keepSegments().reduce((s, [x, y]) => s + (y - x), 0);
-  tlToast(delta < 0.5
-    ? '✂ range cut added — that stretch was already auto-trimmed (dead air), so the totals barely move'
-    : `✂ range cut removes a further ${fmtSec(delta)}`);
-};
+}
 
 let toastTimer;
 function tlToast(msg) {
@@ -1457,6 +1518,12 @@ function setupTimelineContextMenu() {
     const locHere = locate(ct);
     const locSeg = locHere.type === 'base' ? segForSource(locHere.t) : null;
     ctxTarget.camSeg = locSeg && locSeg.cam ? locSeg : null;
+    // delete-a-piece: only on the main track, on a piece, when it's been split
+    const piece = (lane < 0 && !ins) ? segAtTimeline(ct) : null;
+    ctxTarget.seg = piece && segs().length > 1 ? piece : null;
+    $('ctxDeleteSeg').classList.toggle('hidden', !ctxTarget.seg);
+    if (ctxTarget.seg) $('ctxDeleteSeg').textContent =
+      `🗑 Delete this piece (${fmtSec(segLen(ctxTarget.seg))})`;
     $('ctxRemoveCamKf').classList.toggle('hidden', !ctxTarget.camSeg);
     $('ctxClearCamKf').classList.toggle('hidden', !segs().some(sg => sg.cam));
     $('ctxAddTrack').classList.toggle('hidden', !!ins);
@@ -1590,6 +1657,22 @@ $('ctxRemoveInsert').onclick = async () => {
   markDirty(); await saveTranscript();
   updateStats();
   tlToast('insert removed');
+};
+
+$('ctxDeleteSeg').onclick = async () => {
+  if (!ctxTarget.seg) return;
+  tr.segments = segs();
+  const real = tr.segments.find(x => x.id === ctxTarget.seg.id);
+  if (!real || tr.segments.length <= 1) return;
+  const len = segLen(real), p1 = real.pos + len;
+  tr.segments = tr.segments.filter(x => x.id !== real.id);
+  // ripple: close the hole the piece leaves behind
+  for (const sg of tr.segments) if (sg.pos >= p1 - 1e-6) sg.pos = Math.round((sg.pos - len) * 1000) / 1000;
+  for (const ins of (tr.inserts || [])) if (ins.at >= p1 - 1e-6) ins.at = Math.round((ins.at - len) * 100) / 100;
+  syncWordsToArrangement();
+  markDirty(); renderTranscript(); updateStats(); tl.static = null;
+  await saveTranscript();
+  tlToast(`🗑 piece deleted (${fmtSec(len)}) — ⌘Z to undo`);
 };
 
 $('ctxRemoveCamKf').onclick = async () => {
@@ -2264,6 +2347,16 @@ const insFrameEdit = { act: null };
       : '🎞 clip back to full frame');
   });
 })();
+
+// ⌘Z / ⇧⌘Z (or Ctrl on Windows/Linux) = undo / redo
+window.addEventListener('keydown', e => {
+  if (!tr || !(e.metaKey || e.ctrlKey) || e.altKey) return;
+  const k = e.key.toLowerCase();
+  const t = e.target;
+  if (t && t.matches && t.matches('input, textarea, [contenteditable]')) return;
+  if (k === 'z') { e.preventDefault(); histGo(e.shiftKey ? +1 : -1); }
+  else if (k === 'y') { e.preventDefault(); histGo(+1); }
+});
 
 // spacebar toggles play/pause (unless typing in the search box etc.)
 window.addEventListener('keydown', e => {
