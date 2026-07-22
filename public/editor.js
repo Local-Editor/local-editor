@@ -961,9 +961,11 @@ function tlSetup() {
       if (hit) {
         tl.trimDrag = { kind: 'ins', ins: hit.ins, edge: hit.edge, x0: e.clientX, moved: false,
                         at0: hit.ins.at, dur0: hit.ins.duration || 0, src0: hit.ins.srcStart || 0 };
-      } else if (e.shiftKey && lane === tl.selectedLane) {
+      } else if (e.shiftKey) {
+        // ⇧-drag = cut-select, wherever you are: select this timeline and start the band
+        if (tl.selectedLane !== lane) { tl.selectedLane = lane; tl.expandedLane = lane; tl.resize(); }
         tl.drag = { t0: timeAt(e), x0: e.clientX, moved: false };
-      } else if (ins && !e.shiftKey) {
+      } else if (ins) {
         tl.insDrag = { ins, x0: e.clientX, y0: e.clientY, moved: false,
                        at0: ins.at, t0: timeAtRaw(e) };  // grab offset, so the clip doesn't snap its left edge to the cursor
       } else if (lane === tl.selectedLane) {
@@ -987,9 +989,11 @@ function tlSetup() {
         tl.trimDrag = { kind: 'seg', sg: r2, edge: segHit.edge, x0: e.clientX,
                         moved: false, s0: r2.s0, s1: r2.s1, pos0: r2.pos };
       }
-    } else if (e.shiftKey && tl.selectedLane === -1) {
+    } else if (e.shiftKey) {
+      // ⇧-drag on the main track = cut-select there, even if a lane was selected
+      if (tl.selectedLane !== -1) { tl.selectedLane = -1; tl.expandedLane = null; tl.resize(); }
       tl.drag = { t0: timeAt(e), x0: e.clientX, moved: false };
-    } else if (sg && !e.shiftKey) {
+    } else if (sg) {
       // dragging footage moves it — always
       const real = tr.segments.find(x => x.id === sg.id);
       tl.segDrag = { sg: real, t0: timeAt(e), pos0: real.pos, x0: e.clientX,
