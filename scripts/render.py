@@ -176,6 +176,7 @@ def main():
         sidecar = d / ".composite-layouts.json"
         have_layouts = sidecar.read_text() if sidecar.exists() else "[]"
         if not src.exists() or want_layouts != have_layouts:
+            print("»stage composite", flush=True)
             print("building composite (webcam-bubble layout changed)"
                   if src.exists() else "no composite.mp4 — building it first", flush=True)
             subprocess.run([sys.executable, str(Path(__file__).parent / "composite.py"),
@@ -184,6 +185,7 @@ def main():
         src = d / f"reframe-{args.fmt}-{args.layout}.mp4"
         out = d / (args.output or f"clean-{args.fmt}-{args.layout}.mp4")
         if not src.exists():
+            print("»stage reframe", flush=True)
             print(f"building {src.name} first", flush=True)
             subprocess.run([sys.executable, str(Path(__file__).parent / "reframe.py"),
                             str(d), "--format", args.fmt, "--layout", args.layout,
@@ -218,6 +220,7 @@ def main():
     music_ins = [i for i in inserts_all if i.get("kind") == "music"]
     overlays = [i for i in inserts_all if i.get("kind") != "music"]
 
+    print("»stage cut", flush=True)
     tmpdir = Path(tempfile.mkdtemp(prefix="arrange-"))
     blocks = []          # {arr0, arrLen, out0, kind, sg, keeps, effLen}
     files = []           # ordered files to concatenate
@@ -307,17 +310,22 @@ def main():
         arranged.replace(out)
         print(f"clean video: {out} ({duration_of(out):.1f}s)", flush=True)
         return
+    print("»stage mix", flush=True)
 
     base_dur = duration_of(arranged)
     end_needed = max([base_dur] + [ft + fd for ft, fd in times])
     ext = max(0.0, end_needed - base_dur)
 
     total_out = max(base_dur + ext, base_dur)
+    # music-only pass leaves every pixel alone — copy the video stream
+    # instead of re-encoding (fast, no generation loss)
+    video_untouched = not norm and ext <= 0.01
     inputs = ["-i", str(arranged)]
     parts = []
     vprev = "[bv]"
-    parts.append(f"[0:v]tpad=stop_duration={ext:.3f}:color=black[bv]" if ext > 0.01
-                 else "[0:v]null[bv]")
+    if not video_untouched:
+        parts.append(f"[0:v]tpad=stop_duration={ext:.3f}:color=black[bv]" if ext > 0.01
+                     else "[0:v]null[bv]")
     # mono voice: upmix at unity (c0->both), NOT aformat's 0.707 pan-law —
     # players duplicate mono at full level, so 0.707 would make every mixed
     # render 3dB quieter than the plain one
@@ -348,8 +356,11 @@ def main():
     # ---- music beds: gain + fades + position, mixed together, then ducked ----
     mus_pads = []
     for k, (f, m, ft) in enumerate(mus):
-        cl = float(m.get("duration") or 0) or duration_of(f)
-        cl = min(cl, max(0.0, total_out - ft))          # never outlast the video
+        if m.get("loop"):
+            cl = max(0.0, total_out - ft)               # looped: always to the end
+        else:
+            cl = float(m.get("duration") or 0) or duration_of(f)
+            cl = min(cl, max(0.0, total_out - ft))      # never outlast the video
         if cl < 0.1:
             continue
         idx = 1 + len(norm) + len(mus_pads)
@@ -392,9 +403,13 @@ def main():
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         f.write(graph)
         script = f.name
-    run_ffmpeg(inputs + ["-filter_complex_script", script,
-                         "-map", vprev.strip("[]").join(["[", "]"]), "-map", "[a]"]
-               + encode_args(args.quality) + [str(out)])
+    if video_untouched:
+        maps = ["-map", "0:v", "-map", "[a]"]
+        enc = ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+    else:
+        maps = ["-map", vprev.strip("[]").join(["[", "]"]), "-map", "[a]"]
+        enc = encode_args(args.quality)
+    run_ffmpeg(inputs + ["-filter_complex_script", script] + maps + enc + [str(out)])
     print(f"clean video: {out} ({duration_of(out):.1f}s)", flush=True)
 
 

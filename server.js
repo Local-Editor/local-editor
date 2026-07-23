@@ -76,7 +76,11 @@ function runJob(sessionId, name, cmd, args, onDone) {
   const child = spawn(cmd, args, { cwd: ROOT, detached: true });
   job.child = child;
   const capture = d => {
-    job.log += d.toString();
+    const s = d.toString();
+    // scripts announce phases with "»stage <name>" so the UI can label the bar
+    const st = [...s.matchAll(/»stage (\w+)/g)].pop();
+    if (st) job.stage = st[1];
+    job.log += s;
     if (job.log.length > 200000) job.log = job.log.slice(-150000);
   };
   child.stdout.on('data', capture);
@@ -201,7 +205,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/job' && req.method === 'GET') {
       const id = safeSession(url.searchParams.get('session'));
       const job = jobs[id];
-      return json(res, 200, job ? { name: job.name, status: job.status, code: job.code, tail: job.log.slice(-4000) } : { status: 'idle' });
+      return json(res, 200, job ? { name: job.name, status: job.status, code: job.code, stage: job.stage || null, tail: job.log.slice(-4000) } : { status: 'idle' });
     }
 
     if (p === '/api/job/cancel' && req.method === 'POST') {

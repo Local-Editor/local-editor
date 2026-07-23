@@ -768,12 +768,17 @@ async function pollJob(name) {
     $('jobLog').textContent = tail;
     $('jobLog').scrollTop = $('jobLog').scrollHeight;
     if (j.status === 'running') {
+      // renders are multi-pass (composite/reframe -> cut -> mix); name the
+      // pass so a restarting bar reads as progress, not a stuck render
+      const STAGES = { composite: 'building the full composite', reframe: 'reframing',
+                       cut: 'cutting the edit', mix: 'mixing music & overlays' };
+      const stage = STAGES[j.stage] ? ` — ${STAGES[j.stage]}` : '';
       const pct = jobPercent(name, tail);
       if (pct !== null) {
         $('progressFill').style.width = pct + '%';
-        $('progressText').textContent = `${label}… ${pct}%`;
+        $('progressText').textContent = `${label}${stage}… ${pct}%`;
       } else {
-        $('progressText').textContent = `${label}…`;
+        $('progressText').textContent = `${label}${stage}…`;
       }
       continue;
     }
@@ -1080,6 +1085,13 @@ function tlSetup() {
       const hit = !e.shiftKey ? clipEdgeAt(e, lane) : null;
       const ins = hit ? hit.ins : insertAtComp(timeAt(e), lane);
       if (hit) {
+        if (hit.ins.kind === 'music' && hit.ins.loop) {
+          // grabbing an edge means the user wants a manual length
+          hit.ins.duration = Math.round(effDur(hit.ins) * 100) / 100;
+          hit.ins.loop = false;
+          hit.ins.label = (hit.ins.label || '').replace(' 🔁', '');
+          tlToast('🔁 loop off — trimming sets a manual length');
+        }
         tl.trimDrag = { kind: 'ins', ins: hit.ins, edge: hit.edge, x0: e.clientX, moved: false,
                         at0: hit.ins.at, dur0: hit.ins.duration || 0, src0: hit.ins.srcStart || 0 };
       } else if (e.shiftKey) {
@@ -1469,7 +1481,21 @@ function insCuts(ins) {
   return merged;
 }
 function effDur(ins) {
+  // a looped music bed follows the timeline end as the edit changes
+  if (ins.kind === 'music' && ins.loop) return Math.max(1, tlEndSolid() - ins.at);
   return Math.max(0, (ins.duration || 0) - insCuts(ins).reduce((s, [a, b]) => s + (b - a), 0));
+}
+
+// timeline end from footage + fixed-length inserts only — looped music beds
+// derive their length from this, so they must not feed back into it
+function tlEndSolid() {
+  let end = 0;
+  for (const sg of segs()) end = Math.max(end, sg.pos + segLen(sg));
+  for (const i of (tr.inserts || [])) {
+    if (i.kind === 'music' && i.loop) continue;
+    end = Math.max(end, i.at + effDur(i));
+  }
+  return end;
 }
 function rawOfEff(ins, e) {  // effective offset -> raw file offset
   let raw = e;
@@ -1802,9 +1828,9 @@ $('ctxMusicLoop').onclick = async () => {
     tlToast('🔁 loop off — one play-through');
   } else {
     ins.loop = true;
-    ins.duration = Math.round(Math.max(1, end - ins.at) * 100) / 100;
+    ins.duration = Math.round(Math.max(1, end - ins.at) * 100) / 100;  // fallback for older renders
     ins.label = (ins.label || '🎵 music').replace(' 🔁', '') + ' 🔁';
-    tlToast(`🔁 looping to the end of the timeline (${fmtSec(ins.duration)})`);
+    tlToast('🔁 looping — the clip now follows the end of the timeline as your edit changes');
   }
   markDirty(); await saveTranscript(); updateStats(); tl.static = null;
 };
@@ -2211,7 +2237,7 @@ const musicBed = { el: new Audio(), id: null };
 function syncMusicAudio(c) {
   const playing = gap ? !gap.paused : !$('player').paused;
   const m = (tr.inserts || []).find(i =>
-    i.kind === 'music' && c >= i.at && c < i.at + (i.duration || 0));
+    i.kind === 'music' && c >= i.at && c < i.at + effDur(i));
   const el = musicBed.el;
   if (!m || !playing) {
     if (!el.paused) el.pause();

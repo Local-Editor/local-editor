@@ -100,7 +100,9 @@ async function load() {
     // two-step inline confirm — no native dialog
     if (!n.dataset.armed) {
       n.dataset.armed = '1';
-      n.textContent = 'Really delete? Click again';
+      n.textContent = r.kind === 'composite'
+        ? 'Editor rebuilds this on the next render (slow) — delete anyway?'
+        : 'Really delete? Click again';
       n.classList.add('danger');
       setTimeout(() => { n.dataset.armed = ''; n.textContent = 'Delete render'; n.classList.remove('danger'); }, 4000);
       return;
