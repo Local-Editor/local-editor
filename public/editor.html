@@ -73,7 +73,8 @@
               <option value="-17">Present</option>
             </select>
           </label>
-          <button id="musicBtn" class="btn btn-secondary" disabled>Add music</button>
+          <button id="musicPrevBtn" class="btn btn-secondary" disabled title="Preview 30 seconds of the selected track">▶ 30s</button>
+          <button id="musicBtn" class="btn btn-secondary" disabled title="Drops the track onto a Music timeline at the playhead — drag/trim it like any clip; it renders ducked under your voice">🎵 Add to timeline</button>
           <a id="dlMusic" class="btn btn-secondary hidden" download>Download scored video</a>
         </div>
         <div class="controls-row">
@@ -85,6 +86,7 @@
           <div class="progress-row">
             <div class="progress-track"><div id="progressFill"></div></div>
             <span id="progressText" class="hint"></span>
+            <button id="jobCancelBtn" class="btn btn-secondary hidden" title="Stop the running job">✕ Cancel</button>
           </div>
           <details>
             <summary class="hint">show details</summary>

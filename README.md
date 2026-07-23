@@ -92,8 +92,11 @@ Left = video preview + controls. Right = the **transcript**. Bottom = the
 - Format: Original 16:9, or **9:16 / 1:1 Shorts** (webcam-top, screen-top,
   bubble-overlay). Live preview updates when you pick a format.
 - Quality: High / Balanced / Small. Uses the Mac's hardware encoder (fast).
-- 🎵 Background music from the built-in library (auto-ducked under your voice).
-- Progress shows as a % bar; resumes if you reload mid-render.
+- 🎵 Background music is a **timeline track**: pick a track (▶ 30s to preview),
+  hit "Add to timeline" and it lands as a clip on a Music lane at the playhead —
+  drag/trim it like any clip. At render it's mixed **ducked under your voice**.
+- Progress shows as a % bar with a ✕ Cancel button; resumes if you reload
+  mid-render.
 
 ## 3 · Renders  (`/renders.html`)
 

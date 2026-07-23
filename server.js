@@ -31,7 +31,7 @@ fs.mkdirSync(RECORDINGS, { recursive: true });
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
   '.json': 'application/json', '.webm': 'video/webm', '.mp4': 'video/mp4',
-  '.wav': 'audio/wav', '.srt': 'text/plain', '.txt': 'text/plain',
+  '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.srt': 'text/plain', '.txt': 'text/plain',
   '.png': 'image/png', '.svg': 'image/svg+xml',
 };
 
@@ -70,9 +70,11 @@ function runJob(sessionId, name, cmd, args, onDone) {
   if (jobs[sessionId] && jobs[sessionId].status === 'running') {
     throw new Error(`job "${jobs[sessionId].name}" already running for ${sessionId}`);
   }
-  const job = { name, status: 'running', log: '', code: null };
+  const job = { name, status: 'running', log: '', code: null, cancelled: false };
   jobs[sessionId] = job;
-  const child = spawn(cmd, args, { cwd: ROOT });
+  // detached -> own process group, so cancelling kills ffmpeg/whisper children too
+  const child = spawn(cmd, args, { cwd: ROOT, detached: true });
+  job.child = child;
   const capture = d => {
     job.log += d.toString();
     if (job.log.length > 200000) job.log = job.log.slice(-150000);
@@ -81,7 +83,7 @@ function runJob(sessionId, name, cmd, args, onDone) {
   child.stderr.on('data', capture);
   child.on('close', code => {
     job.code = code;
-    job.status = code === 0 ? 'done' : 'error';
+    job.status = code === 0 ? 'done' : job.cancelled ? 'cancelled' : 'error';
     if (onDone) onDone(code);
   });
   child.on('error', err => {
@@ -200,6 +202,17 @@ const server = http.createServer(async (req, res) => {
       const id = safeSession(url.searchParams.get('session'));
       const job = jobs[id];
       return json(res, 200, job ? { name: job.name, status: job.status, code: job.code, tail: job.log.slice(-4000) } : { status: 'idle' });
+    }
+
+    if (p === '/api/job/cancel' && req.method === 'POST') {
+      const id = safeSession(url.searchParams.get('session'));
+      const job = jobs[id];
+      if (!job || job.status !== 'running') return json(res, 200, { ok: false, status: job ? job.status : 'idle' });
+      job.cancelled = true;
+      job.log += '\n— cancelled by user —\n';
+      try { process.kill(-job.child.pid, 'SIGTERM'); }        // whole process group
+      catch { try { job.child.kill('SIGTERM'); } catch {} }
+      return json(res, 200, { ok: true });
     }
 
     if (p === '/api/composite' && req.method === 'POST') {
@@ -349,6 +362,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---------- static ----------
+    if (p.startsWith('/music/')) {
+      const rel = decodeURIComponent(p.slice('/music/'.length));
+      if (!safeName(rel)) { res.writeHead(400); return res.end(); }
+      return serveStatic(res, path.join(ROOT, 'music', rel), req.headers.range);
+    }
     if (p.startsWith('/recordings/')) {
       const rel = decodeURIComponent(p.slice('/recordings/'.length));
       if (rel.includes('..')) { res.writeHead(400); return res.end(); }

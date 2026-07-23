@@ -625,34 +625,67 @@ async function loadMusic() {
   if (!names.length) return; // library empty — selector stays "none"
   $('musicSelect').innerHTML = '<option value="">— none —</option>' +
     names.map(f => `<option value="${esc(f)}">${esc(lib[f].title || f)}${lib[f].feel ? ' · ' + esc(lib[f].feel) : ''}</option>`).join('');
-  $('musicSelect').onchange = () => { $('musicBtn').disabled = !$('musicSelect').value; };
+  $('musicSelect').onchange = () => {
+    $('musicBtn').disabled = !$('musicSelect').value;
+    $('musicPrevBtn').disabled = !$('musicSelect').value;
+    stopMusicPreview();
+  };
 }
 loadMusic();
 
+// ▶ 30s — audition the selected track without touching the timeline
+const audition = { el: new Audio(), timer: null };
+function stopMusicPreview() {
+  audition.el.pause();
+  clearTimeout(audition.timer);
+  $('musicPrevBtn').textContent = '▶ 30s';
+}
+$('musicPrevBtn').onclick = () => {
+  if (!audition.el.paused) return stopMusicPreview();
+  const track = $('musicSelect').value;
+  if (!track) return;
+  audition.el.src = `/music/${encodeURIComponent(track)}`;
+  audition.el.currentTime = 0;
+  audition.el.volume = 0.7;
+  audition.el.play().catch(() => tlToast('couldn’t play the track preview'));
+  $('musicPrevBtn').textContent = '■ Stop';
+  audition.timer = setTimeout(stopMusicPreview, 30000);
+};
+
+// 🎵 Add to timeline — the track becomes a clip on a Music lane at the
+// playhead: drag/trim it like any insert; render ducks it under the voice.
 $('musicBtn').onclick = async () => {
   const track = $('musicSelect').value;
   if (!track) return;
   $('musicBtn').disabled = true;
   try {
-    await saveTranscript();
-    // music goes under the rendered edit for the SELECTED format — render it
-    // first if it doesn't exist yet (render auto-builds the composite too)
-    const [format, layout] = ($('renderFormat').value + '|cam-top').split('|');
-    const file = format === 'wide' ? 'clean.mp4' : `clean-${format}-${layout}.mp4`;
-    const have = (await fetch(`/recordings/${sessionId}/${file}?t=${Date.now()}`,
-      { headers: { Range: 'bytes=0-0' } })).ok;
-    if (!have) {
-      tlToast('🎵 no rendered video yet — rendering your edit first, then adding music');
-      const r = await runJob('render',
-        `&quality=${$('renderQuality').value}&format=${format}&layout=${layout}`);
-      if (r.status !== 'done') return;
-    }
-    const j = await runJob('addmusic',
-      `&track=${encodeURIComponent(track)}&gain=${$('musicGain').value}&input=${encodeURIComponent(file)}`);
-    if (j.status === 'done') {
-      $('dlMusic').classList.remove('hidden');
-      $('dlMusic').href = `/recordings/${sessionId}/${file.replace(/\.mp4$/, '-music.mp4')}?t=${Date.now()}`;
-    }
+    stopMusicPreview();
+    // track length from the audio metadata
+    const trackDur = await new Promise(resolve => {
+      const a = new Audio();
+      a.preload = 'metadata';
+      a.onloadedmetadata = () => resolve(isFinite(a.duration) ? a.duration : 0);
+      a.onerror = () => resolve(0);
+      a.src = `/music/${encodeURIComponent(track)}`;
+    });
+    if (!trackDur) { tlToast('couldn’t read that track — is the music library present?'); return; }
+    // a dedicated Music lane, created on first use
+    tlTracks();
+    if (!tr.tracks.some(t => t.id === 'music')) tr.tracks.push({ id: 'music', name: 'Music' });
+    const at = Math.max(0, Math.min(curTimelineTime(), Math.max(0, tlEnd() - 1)));
+    const duration = Math.max(1, Math.min(trackDur, tlEnd() - at));
+    const title = ($('musicSelect').selectedOptions[0] || {}).textContent || track;
+    tr.inserts = tr.inserts || [];
+    tr.inserts.push({
+      id: `mus-${Date.now().toString(36)}`, at: Math.round(at * 10) / 10,
+      kind: 'music', musicTrack: track, srcStart: 0,
+      duration: Math.round(duration * 100) / 100,
+      gain: parseFloat($('musicGain').value) || -21,
+      label: `🎵 ${title.split(' · ')[0]}`, track: 'music',
+    });
+    markDirty(); await saveTranscript(); updateStats();
+    tl.static = null; tl.resize && tl.resize();
+    tlToast(`🎵 “${title.split(' · ')[0]}” on the Music timeline at ${fmtSec(at)} — drag/trim it like any clip; it ducks under your voice at render`);
   } finally {
     $('musicBtn').disabled = false;
   }
@@ -704,6 +737,7 @@ async function pollJob(name) {
   $('jobProgress').classList.remove('hidden');
   $('progressFill').style.width = '2%';
   $('progressText').textContent = `${label}…`;
+  $('jobCancelBtn').classList.remove('hidden');
   let misses = 0;
   for (;;) {
     await new Promise(r => setTimeout(r, 1500));
@@ -716,6 +750,7 @@ async function pollJob(name) {
       if (++misses < 5) { $('progressText').textContent = `${label}… (reconnecting)`; continue; }
       $('progressFill').style.width = '0%';
       $('progressText').textContent = `${label} — lost contact with the server`;
+      $('jobCancelBtn').classList.add('hidden');
       return { status: 'error' };
     }
     const tail = j.tail || '';
@@ -733,10 +768,19 @@ async function pollJob(name) {
     }
     const ok = j.status === 'done';
     $('progressFill').style.width = ok ? '100%' : '0%';
-    $('progressText').textContent = ok ? `${label} — done ✔` : `${label} — failed (see details)`;
+    $('progressText').textContent = ok ? `${label} — done ✔`
+      : j.status === 'cancelled' ? `${label} — cancelled`
+      : `${label} — failed (see details)`;
+    $('jobCancelBtn').classList.add('hidden');
     return j;
   }
 }
+
+$('jobCancelBtn').onclick = async () => {
+  $('jobCancelBtn').disabled = true;
+  try { await fetch(`/api/job/cancel?session=${sessionId}`, { method: 'POST' }); }
+  finally { $('jobCancelBtn').disabled = false; }
+};
 
 // ---------- exports ----------
 function refreshExports() {
@@ -1473,9 +1517,10 @@ function locate(c) {
 function segAtTimeline(c) {
   return segs().find(sg => c >= sg.pos && c < sg.pos + segLen(sg)) || null;
 }
-// topmost overlay covering a timeline position (lower lane index wins)
+// topmost overlay covering a timeline position (lower lane index wins).
+// Music clips are audio beds, not visual overlays — they never claim the frame.
 function overlayAt(c) {
-  const hits = (tr.inserts || []).filter(i => c >= i.at && c < i.at + effDur(i));
+  const hits = (tr.inserts || []).filter(i => i.kind !== 'music' && c >= i.at && c < i.at + effDur(i));
   hits.sort((a, b) => trackIndex(a) - trackIndex(b));
   return hits[0] || null;
 }
@@ -2041,6 +2086,7 @@ let gap = null;          // {tlPos0, started, untilTl, next}
 let lastMainT = 0;
 
 function insertUrl(ins) {
+  if (ins.musicTrack) return `/music/${encodeURIComponent(ins.musicTrack)}`;
   return ins.fromSession
     ? `/recordings/${encodeURIComponent(ins.fromSession)}/${encodeURIComponent(ins.fromFile || 'composite.mp4')}`
     : `/recordings/${sessionId}/${encodeURIComponent(ins.file)}`;
@@ -2100,6 +2146,31 @@ function overlaySync() {
     if (mainPlaying && ip.paused) ip.play().catch(() => {});
     if (!mainPlaying && !ip.paused) ip.pause();
   }
+  syncMusicAudio(c);
+}
+
+// live music-bed preview: a hidden audio element follows the playhead through
+// any 🎵 clip (no ducking in preview — that happens at render)
+const musicBed = { el: new Audio(), id: null };
+function syncMusicAudio(c) {
+  const playing = gap ? !gap.paused : !$('player').paused;
+  const m = (tr.inserts || []).find(i =>
+    i.kind === 'music' && c >= i.at && c < i.at + (i.duration || 0));
+  const el = musicBed.el;
+  if (!m || !playing) {
+    if (!el.paused) el.pause();
+    if (!m) musicBed.id = null;
+    return;
+  }
+  if (musicBed.id !== m.id) {
+    musicBed.id = m.id;
+    el.src = insertUrl(m);
+    // preview a touch above the true bed level so it's audible over the voice
+    el.volume = Math.max(0.05, Math.min(1, Math.pow(10, (m.gain ?? -21) / 20) * 3));
+  }
+  const want = (m.srcStart || 0) + (c - m.at);
+  if (el.readyState >= 1 && Math.abs(el.currentTime - want) > 0.4) el.currentTime = want;
+  if (el.paused) el.play().catch(() => {});
 }
 
 // keep the playhead moving across segment ends and through gaps

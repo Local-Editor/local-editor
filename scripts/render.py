@@ -72,7 +72,13 @@ def intersect(keeps, s0, s1):
     return [(max(a, s0), min(b, s1)) for a, b in keeps if b > s0 and a < s1]
 
 
+MUSIC_DIR = Path(__file__).resolve().parent.parent / "music"
+
+
 def resolve_insert(d, ins):
+    if ins.get("musicTrack"):
+        f = MUSIC_DIR / ins["musicTrack"]
+        return f if f.exists() else None
     if ins.get("fromSession"):
         other = RECORDINGS / ins["fromSession"]
         comp = other / (ins.get("fromFile") or "composite.mp4")
@@ -207,7 +213,10 @@ def main():
     segments = sorted(tr.get("segments") or
                       [{"id": "seg1", "s0": 0.0, "s1": dur, "pos": 0.0}],
                       key=lambda s: s["pos"])
-    overlays = sorted(tr.get("inserts") or [], key=lambda i: i.get("at", 0))
+    inserts_all = sorted(tr.get("inserts") or [], key=lambda i: i.get("at", 0))
+    # music clips are audio beds mixed (ducked) under the voice, not overlays
+    music_ins = [i for i in inserts_all if i.get("kind") == "music"]
+    overlays = [i for i in inserts_all if i.get("kind") != "music"]
 
     tmpdir = Path(tempfile.mkdtemp(prefix="arrange-"))
     blocks = []          # {arr0, arrLen, out0, kind, sg, keeps, effLen}
@@ -264,13 +273,14 @@ def main():
         run_ffmpeg(inputs + ["-filter_complex", graph, "-map", "[v]", "-map", "[a]"]
                    + encode_args(args.quality) + [str(arranged)])
 
-    if not overlays:
+    if not overlays and not music_ins:
         arranged.replace(out)
         print(f"clean video: {out} ({duration_of(out):.1f}s)", flush=True)
         return
 
     # ---- composite overlays ON TOP at their timeline positions ----
-    print(f"compositing {len(overlays)} overlay(s)", flush=True)
+    if overlays:
+        print(f"compositing {len(overlays)} overlay(s)", flush=True)
     norm, times = [], []
     for k, ins in enumerate(overlays):
         res = normalize_overlay(d, ins, W, H, fps, args.quality, tmpdir, k)
@@ -281,7 +291,19 @@ def main():
         ft = final_time(float(ins.get("at", 0)))
         norm.append((nf, ox, oy))
         times.append((ft, duration_of(nf)))
-    if not norm:
+
+    # ---- resolve music beds ----
+    mus = []
+    for m in music_ins:
+        f = resolve_insert(d, m)
+        if not f:
+            print(f"music {m.get('musicTrack') or m.get('id')}: file missing — skipped", flush=True)
+            continue
+        mus.append((f, m, final_time(float(m.get("at", 0)))))
+    if mus:
+        print(f"mixing {len(mus)} music bed(s), ducked under the voice", flush=True)
+
+    if not norm and not mus:
         arranged.replace(out)
         print(f"clean video: {out} ({duration_of(out):.1f}s)", flush=True)
         return
@@ -290,13 +312,26 @@ def main():
     end_needed = max([base_dur] + [ft + fd for ft, fd in times])
     ext = max(0.0, end_needed - base_dur)
 
+    total_out = max(base_dur + ext, base_dur)
     inputs = ["-i", str(arranged)]
     parts = []
     vprev = "[bv]"
     parts.append(f"[0:v]tpad=stop_duration={ext:.3f}:color=black[bv]" if ext > 0.01
                  else "[0:v]null[bv]")
-    parts.append(f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo"
-                 + (f",apad=pad_dur={ext:.3f}" if ext > 0.01 else "") + "[ba]")
+    # mono voice: upmix at unity (c0->both), NOT aformat's 0.707 pan-law —
+    # players duplicate mono at full level, so 0.707 would make every mixed
+    # render 3dB quieter than the plain one
+    a_st = next((s for s in ffprobe(arranged)["streams"]
+                 if s["codec_type"] == "audio"), None)
+    mono = a_st and int(a_st.get("channels", 2)) == 1
+    base_a = ("[0:a]" + ("pan=stereo|c0=c0|c1=c0," if mono else "")
+              + "aformat=sample_rates=48000:channel_layouts=stereo"
+              + (f",apad=pad_dur={ext:.3f}" if ext > 0.01 else ""))
+    if mus:
+        # the voice doubles as the sidechain key that ducks the music
+        parts.append(base_a + ",asplit=2[ba][sckey]")
+    else:
+        parts.append(base_a + "[ba]")
     amix_pads = ["[ba]"]
     for k, ((nf, ox, oy), (ft, fd)) in enumerate(zip(norm, times)):
         inputs += ["-i", str(nf)]
@@ -309,8 +344,45 @@ def main():
         parts.append(f"[{k + 1}:a]adelay={delay}|{delay},"
                      f"aformat=sample_rates=48000:channel_layouts=stereo[oa{k}]")
         amix_pads.append(f"[oa{k}]")
+
+    # ---- music beds: gain + fades + position, mixed together, then ducked ----
+    mus_pads = []
+    for k, (f, m, ft) in enumerate(mus):
+        cl = float(m.get("duration") or 0) or duration_of(f)
+        cl = min(cl, max(0.0, total_out - ft))          # never outlast the video
+        if cl < 0.1:
+            continue
+        idx = 1 + len(norm) + len(mus_pads)
+        seek = []
+        ss = float(m.get("srcStart") or 0)
+        if ss > 0.01:
+            seek = ["-ss", f"{ss:.3f}"]
+        inputs += seek + ["-i", str(f)]
+        gain = float(m.get("gain", -21))
+        delay = int(round(ft * 1000))
+        fade_out = max(0.0, cl - 2.5)
+        parts.append(f"[{idx}:a]atrim=0:{cl:.3f},volume={gain}dB,"
+                     f"afade=t=in:d=1.5,afade=t=out:st={fade_out:.2f}:d=2.5,"
+                     f"adelay={delay}|{delay},"
+                     f"aformat=sample_rates=48000:channel_layouts=stereo[mu{len(mus_pads)}]")
+        mus_pads.append(f"[mu{len(mus_pads)}]")
+    if mus_pads:
+        if len(mus_pads) > 1:
+            parts.append("".join(mus_pads) +
+                         f"amix=inputs={len(mus_pads)}:duration=longest:dropout_transition=0:normalize=0[muall]")
+            music_lbl = "[muall]"
+        else:
+            music_lbl = mus_pads[0]
+        parts.append(f"{music_lbl}[sckey]sidechaincompress=threshold=0.02:ratio=12"
+                     f":attack=80:release=800:makeup=1[mduck]")
+        amix_pads.append("[mduck]")
+    elif mus:
+        # every bed fell outside the video — drop the unused sidechain key
+        parts.append("[sckey]anullsink")
+    # dropout_transition=0: the default 2s end-of-stream ramp renormalizes the
+    # whole mix ~3dB down when a delayed/trimmed input ends — kills the fix
     parts.append("".join(amix_pads) +
-                 f"amix=inputs={len(amix_pads)}:duration=longest:normalize=0[a]")
+                 f"amix=inputs={len(amix_pads)}:duration=longest:dropout_transition=0:normalize=0[a]")
     graph = ";".join(parts)
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         f.write(graph)
