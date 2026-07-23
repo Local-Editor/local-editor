@@ -633,6 +633,13 @@ async function loadMusic() {
 }
 loadMusic();
 
+$('musicGain').oninput = () => { $('musicGainVal').textContent = $('musicGain').value + '%'; };
+
+// music clip volume: linear 0–1; older clips stored dB in `gain`
+function musicVol(m) {
+  return m.volume ?? Math.pow(10, (m.gain ?? -21) / 20);
+}
+
 // ▶ 30s — audition the selected track without touching the timeline
 const audition = { el: new Audio(), timer: null };
 function stopMusicPreview() {
@@ -680,7 +687,7 @@ $('musicBtn').onclick = async () => {
       id: `mus-${Date.now().toString(36)}`, at: Math.round(at * 10) / 10,
       kind: 'music', musicTrack: track, srcStart: 0,
       duration: Math.round(duration * 100) / 100,
-      gain: parseFloat($('musicGain').value) || -21,
+      volume: (parseFloat($('musicGain').value) || 40) / 100,   // linear 0–1
       label: `🎵 ${title.split(' · ')[0]}`, track: 'music',
     });
     markDirty(); await saveTranscript(); updateStats();
@@ -1591,8 +1598,15 @@ function setupTimelineContextMenu() {
     ctxTarget = { t: ct, ins, lane };  // t = TIMELINE position
     $('ctxRecordInsert').classList.toggle('hidden', !!ins);
     $('ctxFileInsert').classList.toggle('hidden', !!ins);
-    $('ctxOpenInsert').classList.toggle('hidden', !ins);
+    $('ctxOpenInsert').classList.toggle('hidden', !ins || ins.kind === 'music');
     $('ctxRemoveInsert').classList.toggle('hidden', !ins);
+    $('ctxMusicVol').classList.toggle('hidden', !(ins && ins.kind === 'music'));
+    if (ins && ins.kind === 'music') {
+      $('ctxMusicVol').textContent = `🎚 Music volume… (${Math.round(musicVol(ins) * 100)}%)`;
+      $('ctxRemoveInsert').textContent = '✕ Remove music';
+    } else {
+      $('ctxRemoveInsert').textContent = '✕ Remove insert';
+    }
     const locHere = locate(ct);
     const locSeg = locHere.type === 'base' ? segForSource(locHere.t) : null;
     ctxTarget.camSeg = locSeg && locSeg.cam ? locSeg : null;
@@ -1751,6 +1765,19 @@ $('ctxDeleteSeg').onclick = async () => {
   markDirty(); renderTranscript(); updateStats(); tl.static = null;
   await saveTranscript();
   tlToast(`🗑 piece deleted (${fmtSec(len)}) — ⌘Z to undo`);
+};
+
+$('ctxMusicVol').onclick = async () => {
+  const ins = ctxTarget.ins;
+  if (!ins || ins.kind !== 'music') return;
+  const cur = Math.round(musicVol(ins) * 100);
+  const v = prompt('Music volume % (5–100):', cur);
+  if (v === null) return;
+  const pct = Math.max(5, Math.min(100, parseFloat(v) || cur));
+  ins.volume = pct / 100;
+  delete ins.gain;   // % replaces the legacy dB field
+  markDirty(); await saveTranscript();
+  tlToast(`🎚 “${ins.label || 'music'}” at ${pct}% volume`);
 };
 
 $('ctxRemoveCamKf').onclick = async () => {
@@ -2165,9 +2192,10 @@ function syncMusicAudio(c) {
   if (musicBed.id !== m.id) {
     musicBed.id = m.id;
     el.src = insertUrl(m);
-    // preview a touch above the true bed level so it's audible over the voice
-    el.volume = Math.max(0.05, Math.min(1, Math.pow(10, (m.gain ?? -21) / 20) * 3));
   }
+  // read every frame so a right-click volume change applies instantly;
+  // preview plays at the TRUE clip level (render adds ducking on top)
+  el.volume = Math.max(0.02, Math.min(1, musicVol(m)));
   const want = (m.srcStart || 0) + (c - m.at);
   if (el.readyState >= 1 && Math.abs(el.currentTime - want) > 0.4) el.currentTime = want;
   if (el.paused) el.play().catch(() => {});

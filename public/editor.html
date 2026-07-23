@@ -67,11 +67,8 @@
             <select id="musicSelect"><option value="">— none —</option></select>
           </label>
           <label>Level
-            <select id="musicGain">
-              <option value="-24">Subtle</option>
-              <option value="-21" selected>Normal</option>
-              <option value="-17">Present</option>
-            </select>
+            <input type="range" id="musicGain" min="5" max="100" step="5" value="40" style="width:90px;vertical-align:middle">
+            <span id="musicGainVal" class="hint">40%</span>
           </label>
           <button id="musicPrevBtn" class="btn btn-secondary" disabled title="Preview 30 seconds of the selected track">▶ 30s</button>
           <button id="musicBtn" class="btn btn-secondary" disabled title="Drops the track onto a Music timeline at the playhead — drag/trim it like any clip; it renders ducked under your voice">🎵 Add to timeline</button>
@@ -142,6 +139,7 @@
     <button class="mi" id="ctxFromEdit">📼 Add from another edit…</button>
     <button class="mi hidden" id="ctxOpenInsert">▶ Open insert</button>
     <button class="mi danger hidden" id="ctxRemoveInsert">✕ Remove insert</button>
+    <button class="mi hidden" id="ctxMusicVol">🎚 Music volume…</button>
     <button class="mi danger hidden" id="ctxDeleteSeg">🗑 Delete this footage piece</button>
     <button class="mi danger hidden" id="ctxRemoveCamKf">📷 Reset webcam for this piece</button>
     <button class="mi hidden" id="ctxClearCamKf">📷 Clear all webcam placements</button>

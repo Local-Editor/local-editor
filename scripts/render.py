@@ -358,10 +358,13 @@ def main():
         if ss > 0.01:
             seek = ["-ss", f"{ss:.3f}"]
         inputs += seek + ["-i", str(f)]
-        gain = float(m.get("gain", -21))
+        # volume: linear fraction (editor's % slider); older clips stored dB
+        vol = m.get("volume")
+        vol = float(vol) if vol is not None else 10 ** (float(m.get("gain", -21)) / 20)
+        vol = max(0.0, min(1.5, vol))
         delay = int(round(ft * 1000))
         fade_out = max(0.0, cl - 2.5)
-        parts.append(f"[{idx}:a]atrim=0:{cl:.3f},volume={gain}dB,"
+        parts.append(f"[{idx}:a]atrim=0:{cl:.3f},volume={vol:.4f},"
                      f"afade=t=in:d=1.5,afade=t=out:st={fade_out:.2f}:d=2.5,"
                      f"adelay={delay}|{delay},"
                      f"aformat=sample_rates=48000:channel_layouts=stereo[mu{len(mus_pads)}]")
