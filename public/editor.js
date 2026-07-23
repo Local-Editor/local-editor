@@ -640,6 +640,16 @@ function musicVol(m) {
   return m.volume ?? Math.pow(10, (m.gain ?? -21) / 20);
 }
 
+function audioDuration(url) {
+  return new Promise(resolve => {
+    const a = new Audio();
+    a.preload = 'metadata';
+    a.onloadedmetadata = () => resolve(isFinite(a.duration) ? a.duration : 0);
+    a.onerror = () => resolve(0);
+    a.src = url;
+  });
+}
+
 // ▶ 30s — audition the selected track without touching the timeline
 const audition = { el: new Audio(), timer: null };
 function stopMusicPreview() {
@@ -668,13 +678,7 @@ $('musicBtn').onclick = async () => {
   try {
     stopMusicPreview();
     // track length from the audio metadata
-    const trackDur = await new Promise(resolve => {
-      const a = new Audio();
-      a.preload = 'metadata';
-      a.onloadedmetadata = () => resolve(isFinite(a.duration) ? a.duration : 0);
-      a.onerror = () => resolve(0);
-      a.src = `/music/${encodeURIComponent(track)}`;
-    });
+    const trackDur = await audioDuration(`/music/${encodeURIComponent(track)}`);
     if (!trackDur) { tlToast('couldn’t read that track — is the music library present?'); return; }
     // a dedicated Music lane, created on first use
     tlTracks();
@@ -1601,8 +1605,10 @@ function setupTimelineContextMenu() {
     $('ctxOpenInsert').classList.toggle('hidden', !ins || ins.kind === 'music');
     $('ctxRemoveInsert').classList.toggle('hidden', !ins);
     $('ctxMusicVol').classList.toggle('hidden', !(ins && ins.kind === 'music'));
+    $('ctxMusicLoop').classList.toggle('hidden', !(ins && ins.kind === 'music'));
     if (ins && ins.kind === 'music') {
       $('ctxMusicVol').textContent = `🎚 Music volume… (${Math.round(musicVol(ins) * 100)}%)`;
+      $('ctxMusicLoop').textContent = ins.loop ? '🔁 Un-loop (one play-through)' : '🔁 Loop to fill timeline';
       $('ctxRemoveInsert').textContent = '✕ Remove music';
     } else {
       $('ctxRemoveInsert').textContent = '✕ Remove insert';
@@ -1778,6 +1784,29 @@ $('ctxMusicVol').onclick = async () => {
   delete ins.gain;   // % replaces the legacy dB field
   markDirty(); await saveTranscript();
   tlToast(`🎚 “${ins.label || 'music'}” at ${pct}% volume`);
+};
+
+$('ctxMusicLoop').onclick = async () => {
+  const ins = ctxTarget.ins;
+  if (!ins || ins.kind !== 'music') return;
+  // timeline end WITHOUT this clip, so a long music clip can't hold it open
+  const end = Math.max(
+    ...segs().map(sg => sg.pos + segLen(sg)),
+    ...(tr.inserts || []).filter(i => i.id !== ins.id).map(i => i.at + effDur(i)),
+    ins.at + 1);
+  if (ins.loop) {
+    ins.loop = false;
+    const td = await audioDuration(insertUrl(ins));
+    ins.duration = Math.round(Math.min(td || ins.duration, Math.max(1, end - ins.at)) * 100) / 100;
+    ins.label = (ins.label || '🎵 music').replace(' 🔁', '');
+    tlToast('🔁 loop off — one play-through');
+  } else {
+    ins.loop = true;
+    ins.duration = Math.round(Math.max(1, end - ins.at) * 100) / 100;
+    ins.label = (ins.label || '🎵 music').replace(' 🔁', '') + ' 🔁';
+    tlToast(`🔁 looping to the end of the timeline (${fmtSec(ins.duration)})`);
+  }
+  markDirty(); await saveTranscript(); updateStats(); tl.static = null;
 };
 
 $('ctxRemoveCamKf').onclick = async () => {
@@ -2196,7 +2225,9 @@ function syncMusicAudio(c) {
   // read every frame so a right-click volume change applies instantly;
   // preview plays at the TRUE clip level (render adds ducking on top)
   el.volume = Math.max(0.02, Math.min(1, musicVol(m)));
-  const want = (m.srcStart || 0) + (c - m.at);
+  el.loop = !!m.loop;
+  let want = (m.srcStart || 0) + (c - m.at);
+  if (m.loop && el.duration && isFinite(el.duration)) want %= el.duration;
   if (el.readyState >= 1 && Math.abs(el.currentTime - want) > 0.4) el.currentTime = want;
   if (el.paused) el.play().catch(() => {});
 }

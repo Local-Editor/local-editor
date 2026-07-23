@@ -357,6 +357,8 @@ def main():
         ss = float(m.get("srcStart") or 0)
         if ss > 0.01:
             seek = ["-ss", f"{ss:.3f}"]
+        if m.get("loop"):
+            inputs += ["-stream_loop", "-1"]   # atrim below caps the length
         inputs += seek + ["-i", str(f)]
         # volume: linear fraction (editor's % slider); older clips stored dB
         vol = m.get("volume")
