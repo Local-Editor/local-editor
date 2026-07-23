@@ -633,13 +633,28 @@ $('musicBtn').onclick = async () => {
   const track = $('musicSelect').value;
   if (!track) return;
   $('musicBtn').disabled = true;
-  const j = await runJob('addmusic', `&track=${encodeURIComponent(track)}&gain=${$('musicGain').value}`);
-  $('musicBtn').disabled = false;
-  if (j.status === 'done') {
-    const base = (await (await fetch('/api/sessions')).json())
-      .find(s => s.id === sessionId).files.includes('clean.mp4') ? 'clean-music.mp4' : 'composite-music.mp4';
-    $('dlMusic').classList.remove('hidden');
-    $('dlMusic').href = `/recordings/${sessionId}/${base}?t=${Date.now()}`;
+  try {
+    await saveTranscript();
+    // music goes under the rendered edit for the SELECTED format — render it
+    // first if it doesn't exist yet (render auto-builds the composite too)
+    const [format, layout] = ($('renderFormat').value + '|cam-top').split('|');
+    const file = format === 'wide' ? 'clean.mp4' : `clean-${format}-${layout}.mp4`;
+    const have = (await fetch(`/recordings/${sessionId}/${file}?t=${Date.now()}`,
+      { headers: { Range: 'bytes=0-0' } })).ok;
+    if (!have) {
+      tlToast('🎵 no rendered video yet — rendering your edit first, then adding music');
+      const r = await runJob('render',
+        `&quality=${$('renderQuality').value}&format=${format}&layout=${layout}`);
+      if (r.status !== 'done') return;
+    }
+    const j = await runJob('addmusic',
+      `&track=${encodeURIComponent(track)}&gain=${$('musicGain').value}&input=${encodeURIComponent(file)}`);
+    if (j.status === 'done') {
+      $('dlMusic').classList.remove('hidden');
+      $('dlMusic').href = `/recordings/${sessionId}/${file.replace(/\.mp4$/, '-music.mp4')}?t=${Date.now()}`;
+    }
+  } finally {
+    $('musicBtn').disabled = false;
   }
 };
 

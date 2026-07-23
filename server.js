@@ -296,8 +296,13 @@ const server = http.createServer(async (req, res) => {
       const track = url.searchParams.get('track');
       if (!safeName(track)) return json(res, 400, { error: 'bad track name' });
       const gain = String(parseFloat(url.searchParams.get('gain') || '-21') || -21);
-      runJob(id, 'addmusic', PYTHON, [path.join(SCRIPTS, 'addmusic.py'), sessionDir(id),
-        '--track', track, '--gain', gain]);
+      const args = [path.join(SCRIPTS, 'addmusic.py'), sessionDir(id), '--track', track, '--gain', gain];
+      const input = url.searchParams.get('input');
+      if (input) {
+        if (!/^(clean(-[\w-]+)?|composite)\.mp4$/.test(input)) return json(res, 400, { error: 'bad input file' });
+        args.push('--input', input);
+      }
+      runJob(id, 'addmusic', PYTHON, args);
       return json(res, 200, { ok: true, started: 'addmusic' });
     }
 
