@@ -95,8 +95,11 @@ Left = video preview + controls. Right = the **transcript**. Bottom = the
 - 🎵 Background music is a **timeline track**: pick a track (▶ 30s to preview),
   hit "Add to timeline" and it lands as a clip on a Music lane at the playhead —
   drag/trim it like any clip. At render it's mixed **ducked under your voice**.
-- Progress shows as a % bar with a ✕ Cancel button; resumes if you reload
-  mid-render.
+- **Overlay assets**: drop `asset-*.webm` (transparent VP9) or `asset-*.mp4`
+  files into any session folder — they show on the Renders page and in the
+  timeline's 📼 picker, and **transparency survives into the final render**.
+- Progress shows as a % bar with stage labels and a ✕ Cancel button; resumes
+  if you reload mid-render.
 
 ## 3 · Renders  (`/renders.html`)
 
