@@ -2215,6 +2215,7 @@ function overlaySync() {
     activeOverlay = ov;
     if (ov) {
       ip.src = insertUrl(ov);
+      ip.classList.toggle('alpha', isAlphaIns(ov));
       ip.classList.remove('hidden');
       ip.classList.add('editable');
       placeInsertFrame(ov);
@@ -2434,6 +2435,10 @@ function stageVideoBox() {
   return { vx, vy, vw, vh };
 }
 
+// transparent overlay assets (VP9-alpha webm) get no plate, shadow, or corner
+// rounding — the alpha IS the shape
+function isAlphaIns(i) { return /\.webm$/i.test((i && (i.fromFile || i.file || i.musicTrack)) || ''); }
+
 function placeInsertFrame(ov) {
   const ip = $('insertPlayer');
   if (!ov || !ov.frame) {
@@ -2446,8 +2451,9 @@ function placeInsertFrame(ov) {
   const w = f.w * vw;
   const h = w / ar;
   ip.style.cssText = `left:${vx + f.x * vw}px; top:${vy + f.y * vh}px;` +
-    `width:${w}px; height:${h}px; inset:auto; object-fit:cover; border-radius:8px;` +
-    `box-shadow:0 6px 24px rgba(0,0,0,.5);`;
+    `width:${w}px; height:${h}px; inset:auto; object-fit:cover;` +
+    (isAlphaIns(ov) ? 'background:transparent;'
+      : 'border-radius:8px; box-shadow:0 6px 24px rgba(0,0,0,.5);');
 }
 $('insertPlayer').addEventListener('loadedmetadata', () => {
   if (activeOverlay) placeInsertFrame(activeOverlay);
@@ -2503,8 +2509,11 @@ const insFrameEdit = { act: null };
     const { z, s, ar } = a;
     const w0 = a.work;
     if (z === 'move') {
-      w0.x = s.x + dx;
-      w0.y = s.y + dy;
+      // clamp so at least a corner stays on the stage — an offscreen clip
+      // is impossible to grab back
+      const hNow = (s.w * vw / ar) / vh;
+      w0.x = Math.max(-s.w + 0.1, Math.min(0.92, s.x + dx));
+      w0.y = Math.max(-hNow + 0.1, Math.min(0.92, s.y + dy));
     } else {
       const wFromX = z.includes('e') ? s.w + dx : z.includes('w') ? s.w - dx : null;
       const hDelta = z.includes('s') ? dy : z.includes('n') ? -dy : null;
