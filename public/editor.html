@@ -82,6 +82,15 @@
           <a id="dlSrt" class="btn btn-secondary" download>Export .srt</a>
           <a id="dlClean" class="btn btn-secondary hidden" download>Download clean.mp4</a>
         </div>
+        <details id="storageBox" class="storage-box">
+          <summary>Storage <span id="storageTotal" class="hint"></span></summary>
+          <div class="controls-row">
+            <button id="compressFilesBtn" class="btn btn-secondary"
+                    title="Re-encode this recording's source + composite files to reclaim disk space. Raw recordings keep their exact length; a file is only replaced when it actually gets smaller.">🗜 Compress edit files</button>
+            <span id="compressSaved" class="hint"></span>
+          </div>
+          <ul id="fileList" class="file-list"></ul>
+        </details>
         <div id="jobProgress" class="job-progress hidden">
           <div class="progress-row">
             <div class="progress-track"><div id="progressFill"></div></div>

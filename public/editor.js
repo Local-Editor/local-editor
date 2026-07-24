@@ -102,6 +102,7 @@ async function openSession() {
   renderTranscript();
   updateStats();
   tlSetup();
+  loadFileList();
 
   // a job may already be running (page reloaded mid-render) — resume the bar
   const job = await (await fetch(`/api/job?session=${sessionId}`)).json();
@@ -619,6 +620,47 @@ $('renderBtn').onclick = async () => {
   }
 };
 
+// ---------- storage: list this session's media files + one-click compression ----------
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  const u = ['B', 'KB', 'MB', 'GB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
+}
+
+async function loadFileList() {
+  let data;
+  try { data = await (await fetch(`/api/files?session=${sessionId}`)).json(); }
+  catch { return; }
+  const files = data.files || [];
+  $('fileList').innerHTML = files.map(f => {
+    const c = f.compressed;
+    let badge = '';
+    if (c && c.after < c.before) {
+      badge = `<span class="tag tag-ok">compressed −${Math.round((1 - c.after / c.before) * 100)}%</span>`;
+    } else if (c) {
+      badge = '<span class="tag">already compact</span>';
+    }
+    return `<li><span class="fname">${esc(f.name)}</span>` +
+           `<span class="fsize hint">${fmtBytes(f.size)}</span>${badge}</li>`;
+  }).join('') || '<li class="hint">no media files</li>';
+  $('storageTotal').textContent = data.total ? `· ${fmtBytes(data.total)} on disk` : '';
+  const pending = files.some(f => !f.compressed);
+  $('compressFilesBtn').disabled = !pending;
+  $('compressFilesBtn').textContent =
+    files.length && !pending ? '✓ All files compressed' : '🗜 Compress edit files';
+}
+
+$('compressFilesBtn').onclick = async () => {
+  $('compressFilesBtn').disabled = true;
+  let j;
+  try { j = await runJob('compress-files'); }
+  finally { await loadFileList(); refreshDownloadLinks(); }
+  if (j && j.status === 'done') tlToast('🗜 edit files compressed — disk space reclaimed');
+  else if (j && j.status === 'error') tlToast('compression failed — see the job details');
+};
+
 // ---------- background music ----------
 async function loadMusic() {
   const lib = await (await fetch('/api/music')).json();
@@ -712,6 +754,7 @@ $('undoAllBtn').onclick = () => {
 const JOB_LABELS = {
   render: 'Rendering clean video', transcribe: 'Transcribing', composite: 'Compositing',
   addmusic: 'Adding music', enhance: 'AI clean-up', subsession: 'Creating edit session',
+  'compress-files': 'Compressing edit files',
 };
 
 // expected output length in seconds, used to turn ffmpeg/whisper logs into a %
@@ -725,6 +768,12 @@ function jobTarget(name) {
 }
 
 function jobPercent(name, tail) {
+  // multi-file jobs report "[k/N] file…" — progress by file count, not time
+  if (name === 'compress-files') {
+    const m = [...tail.matchAll(/\[(\d+)\/(\d+)\]/g)].pop();
+    if (!m) return null;
+    return Math.max(1, Math.min(99, Math.round((+m[1] - 1) / +m[2] * 100)));
+  }
   let target = jobTarget(name);
   // social renders reframe the FULL recording first, then apply cuts
   if (name === 'render' && tail.includes('building reframe') && !tail.includes('reframed:')) {

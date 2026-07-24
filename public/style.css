@@ -313,6 +313,29 @@ body.wide .transcript { max-height: calc(100vh - 360px); }
 .job-progress details { margin-top: 8px; }
 .job-progress summary { cursor: pointer; color: var(--text-3); font-size: 12.5px; }
 
+/* ---------- storage / edit-file compression ---------- */
+.storage-box { margin: 6px 0 2px; }
+.storage-box > summary {
+  cursor: pointer; color: var(--text-2); font-size: 13px;
+  list-style-position: inside; padding: 4px 0;
+}
+.file-list { list-style: none; margin: 8px 0 4px; padding: 0; }
+.file-list li {
+  display: flex; align-items: center; gap: 10px;
+  padding: 5px 2px; font-size: 12.5px; color: var(--text-2);
+  border-bottom: 1px solid var(--hairline-2);
+}
+.file-list li:last-child { border-bottom: none; }
+.file-list .fname { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.file-list .fsize { margin-left: auto; }
+.tag {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.02em;
+  padding: 2px 8px; border-radius: 980px;
+  background: var(--surface-3); color: var(--text-2);
+}
+.file-list .fsize + .tag { margin-left: 8px; }
+.tag-ok { background: rgba(48, 209, 88, 0.16); color: var(--green); }
+
 /* ---------- timeline dock ---------- */
 .timeline-bar {
   position: fixed; left: 16px; right: 16px; bottom: 14px; z-index: 40;

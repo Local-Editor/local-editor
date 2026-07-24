@@ -352,6 +352,30 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, started: 'render' });
     }
 
+    if (p === '/api/files' && req.method === 'GET') {
+      const id = safeSession(url.searchParams.get('session'));
+      const dir = sessionDir(id);
+      let meta = {};
+      try { meta = JSON.parse(await fsp.readFile(path.join(dir, 'meta.json'), 'utf8')); } catch {}
+      const compressed = meta.compressed || {};
+      const names = (await fsp.readdir(dir).catch(() => []))
+        .filter(n => /\.(webm|mp4|mov)$/i.test(n) && !n.startsWith('asset-') && !n.startsWith('.'))
+        .sort();
+      const files = [];
+      for (const n of names) {
+        let size = 0;
+        try { size = (await fsp.stat(path.join(dir, n))).size; } catch {}
+        files.push({ name: n, size, compressed: compressed[n] || null });
+      }
+      return json(res, 200, { files, total: files.reduce((s, f) => s + f.size, 0) });
+    }
+
+    if (p === '/api/compress-files' && req.method === 'POST') {
+      const id = safeSession(url.searchParams.get('session'));
+      runJob(id, 'compress-files', PYTHON, [path.join(SCRIPTS, 'compress.py'), sessionDir(id)]);
+      return json(res, 200, { ok: true, started: 'compress-files' });
+    }
+
     if (p === '/api/subsession' && req.method === 'POST') {
       const id = safeSession(url.searchParams.get('session'));
       const start = parseFloat(url.searchParams.get('start'));
