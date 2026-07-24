@@ -221,6 +221,9 @@ body.wide .editor-grid { grid-template-columns: minmax(0, 54%) minmax(0, 46%); }
   background: #000; border-radius: var(--r-l);
 }
 .insert-player.editable:hover { outline: 1.5px solid #bf5af2; }
+/* overlays stacked BELOW the topmost one are display-only: they show through the
+   framed/transparent clip above but never steal its resize handles */
+.insert-player.sub { pointer-events: none; }
 /* transparent overlay clips: no plate, shadow, or rounding — the alpha is the shape */
 .insert-player.alpha { background: transparent; box-shadow: none; border-radius: 0; }
 .gap-cover {
@@ -228,7 +231,7 @@ body.wide .editor-grid { grid-template-columns: minmax(0, 54%) minmax(0, 46%); }
   border-radius: var(--r-l);
 }
 .insert-badge {
-  position: absolute; top: 12px; left: 12px; z-index: 7;
+  position: absolute; top: 12px; left: 12px; z-index: 60;
   background: rgba(191, 90, 242, 0.85); color: #fff;
   font-size: 11.5px; font-weight: 600; letter-spacing: 0.02em;
   padding: 3px 12px; border-radius: 980px;

@@ -1554,13 +1554,14 @@ function locate(c) {
 function segAtTimeline(c) {
   return segs().find(sg => c >= sg.pos && c < sg.pos + segLen(sg)) || null;
 }
-// topmost overlay covering a timeline position (lower lane index wins).
+// ALL overlays covering a timeline position, top-first (lower lane index wins).
 // Music clips are audio beds, not visual overlays — they never claim the frame.
-function overlayAt(c) {
+function overlaysAt(c) {
   const hits = (tr.inserts || []).filter(i => i.kind !== 'music' && c >= i.at && c < i.at + effDur(i));
   hits.sort((a, b) => trackIndex(a) - trackIndex(b));
-  return hits[0] || null;
+  return hits;
 }
+function overlayAt(c) { return overlaysAt(c)[0] || null; }
 // estimated FINAL rendered duration: per-segment kept material + gaps + overlay tails
 function finalDuration() {
   const keeps = keepSegments();
@@ -1629,6 +1630,7 @@ function setupTimelineContextMenu() {
     $('ctxRecordInsert').classList.toggle('hidden', !!ins);
     $('ctxFileInsert').classList.toggle('hidden', !!ins);
     $('ctxOpenInsert').classList.toggle('hidden', !ins || ins.kind === 'music');
+    $('ctxDuplicateInsert').classList.toggle('hidden', !ins);
     $('ctxRemoveInsert').classList.toggle('hidden', !ins);
     $('ctxMusicVol').classList.toggle('hidden', !(ins && ins.kind === 'music'));
     $('ctxMusicLoop').classList.toggle('hidden', !(ins && ins.kind === 'music'));
@@ -1779,6 +1781,21 @@ $('ctxOpenInsert').onclick = () => {
     ? `/recordings/${encodeURIComponent(ins.fromSession)}/composite.mp4`
     : `/recordings/${sessionId}/${encodeURIComponent(ins.file)}`;
   window.open(url, '_blank');
+};
+
+$('ctxDuplicateInsert').onclick = async () => {
+  const src = ctxTarget.ins;
+  if (!src) return;
+  // faithful copy — same source, framing, trims, cuts, volume — new id, dropped
+  // right after the original on the SAME track (clips may overlap; they stack)
+  const copy = JSON.parse(JSON.stringify(src));
+  copy.id = `ins-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  copy.track = src.track;
+  copy.at = Math.round((src.at + effDur(src)) * 100) / 100;
+  tr.inserts = tr.inserts || [];
+  tr.inserts.push(copy);
+  markDirty(); tl.static = null; await saveTranscript(); updateStats();
+  tlToast(`⧉ duplicated “${src.label || 'clip'}” at ${fmtSec(copy.at)} — drag it anywhere`);
 };
 
 $('ctxRemoveInsert').onclick = async () => {
@@ -2206,21 +2223,33 @@ function seekTimeline(c) {
   overlaySync();
 }
 
+// Every overlay covering the playhead is drawn as its own stacked <video>, so a
+// clip on an upper track that is framed smaller — or transparent — reveals the
+// footage (or lower overlays) beneath it, exactly like the final render. The
+// TOPMOST overlay owns #insertPlayer and stays editable; the rest are display-
+// only elements pooled by id in subOverlays. Higher tracks get higher z-index.
+const subOverlays = new Map();   // insert id -> <video> (overlays below the top)
+
 function overlaySync() {
   if (!tr) return;
   const c = curTimelineTime();
-  const ov = overlayAt(c);
+  const list = overlaysAt(c);            // top-first (lower track index = on top)
+  const top = list[0] || null;
+  const N = list.length;
+  const mainPlaying = gap ? !gap.paused : !$('player').paused;
   const ip = $('insertPlayer');
-  if ((ov && ov.id) !== (activeOverlay && activeOverlay.id)) {
-    activeOverlay = ov;
-    if (ov) {
-      ip.src = insertUrl(ov);
-      ip.classList.toggle('alpha', isAlphaIns(ov));
+
+  // ---- topmost overlay: editable, on #insertPlayer ----
+  if ((top && top.id) !== (activeOverlay && activeOverlay.id)) {
+    activeOverlay = top;
+    if (top) {
+      ip.src = insertUrl(top);
+      ip.classList.toggle('alpha', isAlphaIns(top));
       ip.classList.remove('hidden');
       ip.classList.add('editable');
-      placeInsertFrame(ov);
+      placeInsertFrame(top);
       $('insertBadge').classList.remove('hidden');
-      $('insertBadge').textContent = `▶ ${ov.label || 'insert'}`;
+      $('insertBadge').textContent = `▶ ${top.label || 'insert'}`;
     } else {
       ip.pause();
       ip.classList.add('hidden');
@@ -2228,13 +2257,47 @@ function overlaySync() {
       $('insertBadge').classList.add('hidden');
     }
   }
-  if (ov) {
-    const want = (ov.srcStart || 0) + rawOfEff(ov, c - ov.at);
+  if (top) {
+    ip.style.zIndex = 6 + N;               // set AFTER placeInsertFrame (cssText wipes it)
+    const want = (top.srcStart || 0) + rawOfEff(top, c - top.at);
     if (ip.readyState >= 1 && Math.abs(ip.currentTime - want) > 0.4) ip.currentTime = want;
-    const mainPlaying = gap ? !gap.paused : !$('player').paused;
     if (mainPlaying && ip.paused) ip.play().catch(() => {});
     if (!mainPlaying && !ip.paused) ip.pause();
   }
+
+  // ---- overlays beneath the top: display-only, stacked in track order ----
+  const subs = list.slice(1);
+  const alive = new Set(subs.map(s => s.id));
+  for (const [id, el] of subOverlays) {
+    if (!alive.has(id)) { el.pause(); el.remove(); subOverlays.delete(id); }
+  }
+  subs.forEach((ov, j) => {
+    let el = subOverlays.get(ov.id);
+    if (!el) {
+      el = document.createElement('video');
+      el.className = 'insert-player sub';
+      el.playsInline = true;
+      el.muted = true;                     // preview: the top overlay carries audio
+      el.src = insertUrl(ov);
+      el.classList.toggle('alpha', isAlphaIns(ov));
+      el.addEventListener('loadedmetadata', () => { if (el._ov) placeInsertFrame(el._ov, el); });
+      el.addEventListener('timeupdate', () => {
+        if (!el._ov || el.paused) return;
+        const t = el.currentTime;
+        for (const [a, b] of insCuts(el._ov)) if (t >= a - 0.05 && t < b) { el.currentTime = b; return; }
+      });
+      $('playerStage').appendChild(el);
+      subOverlays.set(ov.id, el);
+    }
+    el._ov = ov;
+    placeInsertFrame(ov, el);
+    el.style.zIndex = 6 + N - j - 1;       // just under the sub above it; top is 6+N
+    const want = (ov.srcStart || 0) + rawOfEff(ov, c - ov.at);
+    if (el.readyState >= 1 && Math.abs(el.currentTime - want) > 0.4) el.currentTime = want;
+    if (mainPlaying && el.paused) el.play().catch(() => {});
+    if (!mainPlaying && !el.paused) el.pause();
+  });
+
   syncMusicAudio(c);
 }
 
@@ -2439,8 +2502,7 @@ function stageVideoBox() {
 // rounding — the alpha IS the shape
 function isAlphaIns(i) { return /\.webm$/i.test((i && (i.fromFile || i.file || i.musicTrack)) || ''); }
 
-function placeInsertFrame(ov) {
-  const ip = $('insertPlayer');
+function placeInsertFrame(ov, ip = $('insertPlayer')) {
   if (!ov || !ov.frame) {
     ip.style.cssText = '';   // full frame (CSS default: inset 0)
     return;

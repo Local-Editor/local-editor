@@ -241,6 +241,17 @@ def main():
     # music clips are audio beds mixed (ducked) under the voice, not overlays
     music_ins = [i for i in inserts_all if i.get("kind") == "music"]
     overlays = [i for i in inserts_all if i.get("kind") != "music"]
+    # stack by track like the editor preview: the upper track (lower index) wins.
+    # overlays are composited in list order and the LAST one lands on top, so
+    # sort upper tracks LAST (track index descending), ties broken by position.
+    track_ids = [t.get("id") for t in (tr.get("tracks") or [])]
+
+    def _track_rank(ins):
+        try:
+            return track_ids.index(ins.get("track"))
+        except ValueError:
+            return 0
+    overlays.sort(key=lambda i: (-_track_rank(i), i.get("at", 0)))
 
     print("»stage cut", flush=True)
     tmpdir = Path(tempfile.mkdtemp(prefix="arrange-"))
