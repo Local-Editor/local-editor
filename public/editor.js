@@ -1696,8 +1696,19 @@ $('ctxFromEdit').onclick = async e => {
     return btns.join('');
   }).join('');
   const menu = $('tlContext').getBoundingClientRect();
-  picker.style.maxHeight = '50vh';
+  // show at most 7 rows, then scroll — a long list must never run off-screen.
+  // measure the real (uncapped) row layout first, then cap to the 7th row's
+  // bottom (+6px for the menu's bottom padding & border, box-sizing: border-box)
   picker.style.overflow = 'auto';
+  picker.style.maxHeight = '';
+  picker.classList.remove('hidden');
+  if (picker.parentElement !== document.body) document.body.appendChild(picker);
+  picker.style.position = 'fixed';
+  const rows = picker.querySelectorAll('.mi');
+  if (rows.length > 7) {
+    const seventh = rows[6];
+    picker.style.maxHeight = (seventh.offsetTop + seventh.offsetHeight + 6) + 'px';
+  }
   placeMenu(picker, menu.left + 40, menu.top);
   picker.querySelectorAll('.mi').forEach(btn => btn.onclick = async () => {
     picker.classList.add('hidden');
