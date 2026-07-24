@@ -39,7 +39,8 @@ async function loadSessions() {
       <button id="compressAllBtn" class="btn btn-secondary"${anyPending ? '' : ' disabled'}
         title="Re-encode every recording's source + composite files to reclaim disk space. Each file keeps its exact length; only replaced when it actually gets smaller.">🗜 Compress all recordings</button>
       <span id="compressAllStatus" class="hint"></span>
-    </div>` +
+    </div>
+    <div id="compressAllBar" class="progress-track compress-all-bar hidden"><div id="compressAllFill"></div></div>` +
     sessions.map(s => {
       const { media, pending } = sessionMedia(s);
       const ctl = pending.length
@@ -65,8 +66,9 @@ async function compressSession(id, onProgress) {
     try { j = await (await fetch(`/api/job?session=${encodeURIComponent(id)}`)).json(); }
     catch { continue; }
     if (j.status === 'running') {
+      // compress.py logs "[k/N] file…" at the START of file k, so k-1 are done
       const m = [...(j.tail || '').matchAll(/\[(\d+)\/(\d+)\]/g)].pop();
-      if (onProgress) onProgress(m ? `${m[1]}/${m[2]}` : '…');
+      if (onProgress) onProgress(m ? +m[1] : 0, m ? +m[2] : 0);
       continue;
     }
     return j;
@@ -79,24 +81,41 @@ $('sessionList').addEventListener('click', async e => {
   if (!btn) return;
   e.preventDefault();
   btn.disabled = true;
-  const j = await compressSession(btn.dataset.id, p => btn.textContent = `compressing ${p}…`);
+  const j = await compressSession(btn.dataset.id,
+    (k, n) => btn.textContent = n ? `compressing ${k}/${n}…` : 'compressing…');
   btn.textContent = j && j.status === 'done' ? '✓ compressed' : '⚠ failed';
   await loadSessions();
 });
 
-// "Compress all recordings" — every session with pending files, one at a time
+// "Compress all recordings" — every session with pending files, one at a time,
+// with an overall % bar that advances across recordings AND within each one
 async function compressAllSessions() {
   const sessions = await (await fetch('/api/sessions')).json();
   const todo = sessions.filter(s => sessionMedia(s).pending.length);
+  const counts = todo.map(s => sessionMedia(s).pending.length);
+  const M = todo.length;
   $('compressAllBtn').disabled = true;
-  for (let i = 0; i < todo.length; i++) {
-    const label = `compressing ${i + 1}/${todo.length}: ${todo[i].title}`;
-    $('compressAllStatus').textContent = `${label}…`;
-    await compressSession(todo[i].id, p => { $('compressAllStatus').textContent = `${label} (${p})…`; });
+  const fill = $('compressAllFill'), status = $('compressAllStatus');
+  $('compressAllBar').classList.remove('hidden');
+
+  // progress = fully-done recordings + fraction of the current one's files, over M
+  const show = (i, n, k) => {
+    const frac = M ? (i + (n ? Math.max(0, k - 1) / n : 0)) / M : 1;
+    const pct = Math.round(frac * 100);
+    fill.style.width = pct + '%';
+    status.textContent = `${pct}% — recording ${i + 1}/${M}: ${todo[i].title}`
+      + (k ? ` (file ${k}/${n})` : '') + '…';
+  };
+
+  for (let i = 0; i < M; i++) {
+    show(i, counts[i], 0);
+    await compressSession(todo[i].id, (k, n) => show(i, n || counts[i], k));
   }
+  fill.style.width = '100%';
   await loadSessions();
-  $('compressAllStatus').textContent = todo.length
-    ? `✓ compressed ${todo.length} recording${todo.length > 1 ? 's' : ''}` : 'nothing to compress';
+  $('compressAllStatus').textContent = M
+    ? `✓ compressed ${M} recording${M > 1 ? 's' : ''} · ${counts.reduce((a, b) => a + b, 0)} files`
+    : 'nothing to compress';
 }
 
 // ---------- editor ----------

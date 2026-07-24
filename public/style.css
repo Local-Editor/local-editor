@@ -304,6 +304,12 @@ body.wide .transcript { max-height: calc(100vh - 360px); }
 .session-row > a { font-weight: 600; }
 .session-row .sess-compress-btn { margin-left: auto; padding: 4px 12px; font-size: 12.5px; }
 .session-row .tag { margin-left: auto; }
+.compress-all-bar { margin: 0 0 14px; }
+#compressAllFill {
+  height: 100%; width: 0; border-radius: 980px;
+  background: linear-gradient(90deg, var(--accent), #64d2ff);
+  transition: width 0.4s var(--ease);
+}
 
 /* ---------- progress ---------- */
 .job-progress { margin: 12px 0; }
