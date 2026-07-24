@@ -90,15 +90,32 @@ def resolve_insert(d, ins):
     return f if f.exists() else None
 
 
+def stream_has_alpha(vs):
+    """True when the video stream carries an alpha channel (ProRes 4444,
+    VP9-alpha webm, PNG-style formats). VP9 hides it behind a tag."""
+    if not vs:
+        return False
+    if vs.get("pix_fmt", "").startswith(("yuva", "rgba", "argb", "bgra", "gbrap")):
+        return True
+    tags = {k.lower(): v for k, v in (vs.get("tags") or {}).items()}
+    return tags.get("alpha_mode") == "1"
+
+
 def normalize_overlay(d, ins, W, H, fps, quality, tmpdir, k):
     """Insert file -> normalized clip with its own cuts applied.
     Returns (file, ox, oy): framed clips (ins.frame) scale to the frame width
-    at their own aspect and overlay at (ox, oy); others fill the screen."""
+    at their own aspect and overlay at (ox, oy); others fill the screen.
+    Transparent sources stay transparent (ProRes 4444 intermediate)."""
     f = resolve_insert(d, ins)
     if not f:
         return None
-    norm = tmpdir / f"ov{k}.mp4"
     probe = ffprobe(f)
+    alpha = stream_has_alpha(video_stream(probe))
+    norm = tmpdir / (f"ov{k}.mov" if alpha else f"ov{k}.mp4")
+    # ffmpeg's native vp9 decoder silently drops the alpha plane
+    dec = ["-c:v", "libvpx-vp9"] if alpha and f.suffix.lower() == ".webm" else []
+    enc = (["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
+            "-c:a", "aac", "-b:a", "192k"] if alpha else encode_args(quality))
     frame = ins.get("frame")
     ox = int(float(frame["x"]) * W) if frame else 0
     oy = int(float(frame["y"]) * H) if frame else 0
@@ -118,19 +135,24 @@ def normalize_overlay(d, ins, W, H, fps, quality, tmpdir, k):
             fw = even(max(64, float(frame["w"]) * W))
             vf = f"scale={fw}:-2,fps={fps:g},setsar=1"
         else:
+            pad_color = ":color=black@0" if alpha else ""
             vf = (f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
-                  f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,fps={fps:g},setsar=1")
-        args = seek + ["-i", str(f), "-vf", vf]
+                  f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2{pad_color},fps={fps:g},setsar=1")
+        args = dec + seek + ["-i", str(f), "-vf", vf]
         if not has_audio(probe):
-            args = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"] + seek + \
+            args = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"] + dec + seek + \
                    ["-i", str(f), "-vf", vf, "-map", "1:v", "-map", "0:a", "-shortest"]
     else:
         adur = min(dur_used, src_total - src_start) if dur_used > 0 else duration_of(f)
         args = ["-f", "lavfi", "-i", f"color=black:size={W}x{H}:rate={fps:g}"] + \
                seek + ["-i", str(f), "-map", "0:v", "-map", "1:a", "-t", f"{adur:.3f}"]
-    run_ffmpeg(args + ["-ar", "48000", "-ac", "2"] + encode_args(quality) + [str(norm)])
+    run_ffmpeg(args + ["-ar", "48000", "-ac", "2"] + enc + [str(norm)])
 
     cuts = sorted([list(map(float, c)) for c in (ins.get("cuts") or [])])
+    if cuts and alpha:
+        print(f"overlay {ins.get('id')}: internal cuts aren't supported on "
+              f"transparent clips yet — playing it uncut", flush=True)
+        cuts = []
     if cuts:
         ndur = duration_of(norm)
         keeps, pos = [], 0.0

@@ -30,7 +30,7 @@ fs.mkdirSync(RECORDINGS, { recursive: true });
 
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
-  '.json': 'application/json', '.webm': 'video/webm', '.mp4': 'video/mp4',
+  '.json': 'application/json', '.webm': 'video/webm', '.mp4': 'video/mp4', '.mov': 'video/quicktime',
   '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.srt': 'text/plain', '.txt': 'text/plain',
   '.png': 'image/png', '.svg': 'image/svg+xml',
 };
@@ -287,7 +287,8 @@ const server = http.createServer(async (req, res) => {
         for (const f of files) {
           const kind = f.endsWith('-music.mp4') ? 'music'
             : /^clean(-[\w-]+)?\.mp4$/.test(f) ? 'clean'
-            : f === 'composite.mp4' ? 'composite' : null; // reframe-* are intermediates
+            : f === 'composite.mp4' ? 'composite'
+            : /^asset-[\w-]+\.(mp4|webm)$/.test(f) ? 'asset' : null; // reframe-* are intermediates
           if (!kind) continue;
           const st = await fsp.stat(path.join(dir, f)).catch(() => null);
           if (!st || !st.size) continue;
@@ -359,7 +360,7 @@ const server = http.createServer(async (req, res) => {
       const id = safeSession(url.searchParams.get('session'));
       const file = url.searchParams.get('file') || '';
       // only finished render outputs may be deleted — never the raw recordings
-      const deletable = /^(clean(-[\w-]+)?\.mp4|[\w-]+-music\.mp4|composite\.mp4|reframe-[\w-]+\.mp4)$/;
+      const deletable = /^(clean(-[\w-]+)?\.mp4|[\w-]+-music\.mp4|composite\.mp4|reframe-[\w-]+\.mp4|asset-[\w-]+\.(mp4|webm|mov))$/;
       if (!deletable.test(file)) return json(res, 400, { error: 'not a deletable render file' });
       await fsp.unlink(path.join(sessionDir(id), file)).catch(err => { throw err; });
       return json(res, 200, { ok: true, deleted: `${id}/${file}` });

@@ -1674,8 +1674,10 @@ $('ctxFromEdit').onclick = async e => {
   const target = { t: ctxTarget.t, lane: Math.max(0, ctxTarget.lane) };
   const sessions = (await (await fetch('/api/sessions')).json())
     // any OTHER session with playable material — including raw recordings
-    // that haven't been composited yet (we build the composite on add)
-    .filter(s => s.id !== sessionId && (s.hasClean || s.hasComposite || s.hasRaw));
+    // that haven't been composited yet (we build the composite on add) and
+    // asset-only sessions (transparent overlays, stock clips)
+    .filter(s => s.id !== sessionId && (s.hasClean || s.hasComposite || s.hasRaw
+      || s.files.some(f => /^asset-[\w-]+\.(mp4|webm)$/.test(f))));
   const picker = $('editPicker');
   if (!sessions.length) { tlToast('no other recordings or edits found yet'); return; }
   picker.innerHTML = sessions.map(s => {
@@ -1685,6 +1687,10 @@ $('ctxFromEdit').onclick = async e => {
     // raw recording, not composited yet: build it when picked
     if (!s.hasComposite && !s.hasClean && s.hasRaw)
       btns.push(`<button class="mi" data-id="${esc(s.id)}" data-file="composite.mp4" data-build="1">${esc(s.title)} — recording (prepares on add)</button>`);
+    for (const f of s.files.filter(x => /^asset-[\w-]+\.(mp4|webm)$/.test(x))) {
+      const nice = f.replace(/^asset-/, '').replace(/\.(mp4|webm)$/, '').replace(/-/g, ' ');
+      btns.push(`<button class="mi" data-id="${esc(s.id)}" data-file="${esc(f)}">🎞 ${esc(nice)}${f.endsWith('.webm') ? ' (transparent)' : ''}</button>`);
+    }
     return btns.join('');
   }).join('');
   const menu = $('tlContext').getBoundingClientRect();

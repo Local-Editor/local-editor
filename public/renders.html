@@ -20,6 +20,7 @@ const KIND_LABELS = {
   clean: { label: 'Clean render', hint: 'cuts + clean-up applied', cls: 'kind-clean' },
   music: { label: 'With music', hint: 'clean render + background track', cls: 'kind-music' },
   composite: { label: 'Full composite', hint: 'screen + webcam, uncut', cls: 'kind-composite' },
+  asset: { label: 'Asset', hint: 'overlay / stock clip — insert it from the editor timeline', cls: 'kind-music' },
 };
 
 function fmtSize(b) {
@@ -51,7 +52,8 @@ async function load() {
     const k = KIND_LABELS[r.kind] || { label: r.kind, hint: '', cls: '' };
     const url = `/recordings/${encodeURIComponent(r.session)}/${encodeURIComponent(r.file)}`;
     const shown = r.label || `${r.title} — ${k.label}`;
-    const dlName = slug(r.label || `${r.title}-${r.kind}`) + '.mp4';
+    const ext = (r.file.match(/\.\w+$/) || ['.mp4'])[0];
+    const dlName = slug(r.label || `${r.title}-${r.kind}`) + ext;
     return `
     <div class="render-card" data-i="${i}">
       <video src="${url}" controls preload="metadata"></video>
