@@ -2509,11 +2509,8 @@ const insFrameEdit = { act: null };
     const { z, s, ar } = a;
     const w0 = a.work;
     if (z === 'move') {
-      // clamp so at least a corner stays on the stage — an offscreen clip
-      // is impossible to grab back
-      const hNow = (s.w * vw / ar) / vh;
-      w0.x = Math.max(-s.w + 0.1, Math.min(0.92, s.x + dx));
-      w0.y = Math.max(-hNow + 0.1, Math.min(0.92, s.y + dy));
+      w0.x = s.x + dx;
+      w0.y = s.y + dy;
     } else {
       const wFromX = z.includes('e') ? s.w + dx : z.includes('w') ? s.w - dx : null;
       const hDelta = z.includes('s') ? dy : z.includes('n') ? -dy : null;
@@ -2524,19 +2521,24 @@ const insFrameEdit = { act: null };
       } else {
         wN = wFromX !== null ? wFromX : wFromY;
       }
-      wN = Math.min(Math.max(wN, 0.1), 1.2);
-      // a resize must not push the clip off the stage: cap the width by
-      // whichever edges stay anchored (small overhang allowed)
-      const OV = 0.12;
-      if (z.includes('w')) wN = Math.min(wN, s.x + s.w + OV);
-      else wN = Math.min(wN, 1 + OV - s.x);                       // left edge anchored
-      if (z.includes('n')) wN = Math.min(wN, ((s.y + s.hN + OV) * vh * ar) / vw);
-      else wN = Math.min(wN, ((1 + OV - s.y) * vh * ar) / vw);    // top edge anchored
-      wN = Math.max(wN, 0.1);
+      // like the webcam bubble: the clip lives fully INSIDE the stage.
+      // Cap the width by whichever edges stay anchored during this resize.
+      wN = Math.min(Math.max(wN, 0.08), 1);
+      if (z.includes('w')) wN = Math.min(wN, s.x + s.w);            // right edge anchored
+      else wN = Math.min(wN, 1 - s.x);                              // left edge anchored
+      if (z.includes('n')) wN = Math.min(wN, ((s.y + s.hN) * vh * ar) / vw);  // bottom anchored
+      else wN = Math.min(wN, ((1 - s.y) * vh * ar) / vw);           // top anchored
+      wN = Math.max(wN, 0.08);
       const hN2 = (wN * vw / ar) / vh;
       if (z.includes('w')) w0.x = s.x + s.w - wN;
       if (z.includes('n')) w0.y = s.y + s.hN - hN2;
       w0.w = wN;
+    }
+    // final confinement, exactly like the bubble's clampLayout
+    {
+      const hN = (w0.w * vw / ar) / vh;
+      w0.x = Math.min(Math.max(w0.x, 0), Math.max(0, 1 - w0.w));
+      w0.y = Math.min(Math.max(w0.y, 0), Math.max(0, 1 - hN));
     }
     a.ov.frame = { x: w0.x, y: w0.y, w: w0.w };
     placeInsertFrame(a.ov);
