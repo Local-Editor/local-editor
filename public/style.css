@@ -296,6 +296,14 @@ body.wide .transcript { max-height: calc(100vh - 360px); }
 
 .session-list a { color: var(--accent); text-decoration: none; }
 .session-list a:hover { text-decoration: underline; }
+.session-tools { margin: 4px 0 14px; }
+.session-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 2px; margin: 0; border-bottom: 1px solid var(--hairline-2);
+}
+.session-row > a { font-weight: 600; }
+.session-row .sess-compress-btn { margin-left: auto; padding: 4px 12px; font-size: 12.5px; }
+.session-row .tag { margin-left: auto; }
 
 /* ---------- progress ---------- */
 .job-progress { margin: 12px 0; }

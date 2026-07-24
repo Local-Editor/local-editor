@@ -21,16 +21,82 @@ let dirty = false;
 const GAP_SHOW_SEC = 1.5; // show a chip for pauses at least this long
 
 // ---------- session picker ----------
+const MEDIA_RE = /\.(webm|mp4|mov)$/i;
+// a session's compressible media (raw + composite + renders) and which are still uncompressed
+function sessionMedia(s) {
+  const media = (s.files || []).filter(n =>
+    MEDIA_RE.test(n) && !n.startsWith('asset-') && !n.startsWith('mask-') && !n.startsWith('.'));
+  const done = s.compressed || {};
+  return { media, pending: media.filter(n => !done[n]) };
+}
+
 async function loadSessions() {
   const sessions = await (await fetch('/api/sessions')).json();
   if (!sessions.length) { $('sessionList').textContent = 'No recordings yet — make one on the Record tab.'; return; }
-  $('sessionList').innerHTML = sessions.map(s => `
-    <p>
-      <a href="editor.html?session=${encodeURIComponent(s.id)}">${esc(s.title)}</a>
-      ${s.hasComposite ? '· composite ✔' : ''}
-      ${s.hasTranscript ? '· transcript ✔' : '· <em>no transcript yet</em>'}
-      ${s.hasClean ? '· clean.mp4 ✔' : ''}
-    </p>`).join('');
+  const anyPending = sessions.some(s => sessionMedia(s).pending.length);
+  $('sessionList').innerHTML = `
+    <div class="controls-row session-tools">
+      <button id="compressAllBtn" class="btn btn-secondary"${anyPending ? '' : ' disabled'}
+        title="Re-encode every recording's source + composite files to reclaim disk space. Each file keeps its exact length; only replaced when it actually gets smaller.">🗜 Compress all recordings</button>
+      <span id="compressAllStatus" class="hint"></span>
+    </div>` +
+    sessions.map(s => {
+      const { media, pending } = sessionMedia(s);
+      const ctl = pending.length
+        ? `<button class="btn btn-secondary sess-compress-btn" data-id="${esc(s.id)}">🗜 Compress (${pending.length})</button>`
+        : media.length ? '<span class="tag tag-ok">compressed ✔</span>' : '';
+      return `<p class="session-row" data-id="${esc(s.id)}">
+        <a href="editor.html?session=${encodeURIComponent(s.id)}">${esc(s.title)}</a>
+        <span class="hint">${s.hasComposite ? '· composite ✔' : ''}
+        ${s.hasTranscript ? '· transcript ✔' : '· <em>no transcript yet</em>'}
+        ${s.hasClean ? '· clean.mp4 ✔' : ''}</span>
+        ${ctl}
+      </p>`;
+    }).join('');
+  $('compressAllBtn').onclick = compressAllSessions;
+}
+
+// compress ONE session's files, resolving when the job finishes; onProgress("k/N")
+async function compressSession(id, onProgress) {
+  await fetch(`/api/compress-files?session=${encodeURIComponent(id)}`, { method: 'POST' });
+  for (;;) {
+    await new Promise(r => setTimeout(r, 1200));
+    let j;
+    try { j = await (await fetch(`/api/job?session=${encodeURIComponent(id)}`)).json(); }
+    catch { continue; }
+    if (j.status === 'running') {
+      const m = [...(j.tail || '').matchAll(/\[(\d+)\/(\d+)\]/g)].pop();
+      if (onProgress) onProgress(m ? `${m[1]}/${m[2]}` : '…');
+      continue;
+    }
+    return j;
+  }
+}
+
+// per-recording "Compress" button (event-delegated — the list is re-rendered often)
+$('sessionList').addEventListener('click', async e => {
+  const btn = e.target.closest('.sess-compress-btn');
+  if (!btn) return;
+  e.preventDefault();
+  btn.disabled = true;
+  const j = await compressSession(btn.dataset.id, p => btn.textContent = `compressing ${p}…`);
+  btn.textContent = j && j.status === 'done' ? '✓ compressed' : '⚠ failed';
+  await loadSessions();
+});
+
+// "Compress all recordings" — every session with pending files, one at a time
+async function compressAllSessions() {
+  const sessions = await (await fetch('/api/sessions')).json();
+  const todo = sessions.filter(s => sessionMedia(s).pending.length);
+  $('compressAllBtn').disabled = true;
+  for (let i = 0; i < todo.length; i++) {
+    const label = `compressing ${i + 1}/${todo.length}: ${todo[i].title}`;
+    $('compressAllStatus').textContent = `${label}…`;
+    await compressSession(todo[i].id, p => { $('compressAllStatus').textContent = `${label} (${p})…`; });
+  }
+  await loadSessions();
+  $('compressAllStatus').textContent = todo.length
+    ? `✓ compressed ${todo.length} recording${todo.length > 1 ? 's' : ''}` : 'nothing to compress';
 }
 
 // ---------- editor ----------

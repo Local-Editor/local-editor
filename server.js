@@ -113,6 +113,7 @@ async function listSessions() {
       createdAt: meta.createdAt || null,
       title: meta.title || e.name,
       renderNames: meta.renderNames || {},
+      compressed: meta.compressed || {},
       hasComposite: files.includes('composite.mp4'),
       hasTranscript: files.includes('transcript.json'),
       hasClean: files.includes('clean.mp4'),
