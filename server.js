@@ -126,7 +126,13 @@ async function listSessions() {
 function serveStatic(res, filePath, range) {
   fs.stat(filePath, (err, stat) => {
     if (err || !stat.isFile()) { res.writeHead(404); res.end('not found'); return; }
-    const type = MIME[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+    const ext = path.extname(filePath).toLowerCase();
+    const type = MIME[ext] || 'application/octet-stream';
+    // app files must never be cached — with no headers Chrome caches
+    // heuristically and a plain refresh can keep running week-old JS
+    if (['.html', '.js', '.css', '.json'].includes(ext)) {
+      res.setHeader('Cache-Control', 'no-store');
+    }
     // Range support so <video> seeking works.
     if (range) {
       const m = /bytes=(\d*)-(\d*)/.exec(range);
