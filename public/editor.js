@@ -2525,6 +2525,14 @@ const insFrameEdit = { act: null };
         wN = wFromX !== null ? wFromX : wFromY;
       }
       wN = Math.min(Math.max(wN, 0.1), 1.2);
+      // a resize must not push the clip off the stage: cap the width by
+      // whichever edges stay anchored (small overhang allowed)
+      const OV = 0.12;
+      if (z.includes('w')) wN = Math.min(wN, s.x + s.w + OV);
+      else wN = Math.min(wN, 1 + OV - s.x);                       // left edge anchored
+      if (z.includes('n')) wN = Math.min(wN, ((s.y + s.hN + OV) * vh * ar) / vw);
+      else wN = Math.min(wN, ((1 + OV - s.y) * vh * ar) / vw);    // top edge anchored
+      wN = Math.max(wN, 0.1);
       const hN2 = (wN * vw / ar) / vh;
       if (z.includes('w')) w0.x = s.x + s.w - wN;
       if (z.includes('n')) w0.y = s.y + s.hN - hN2;
