@@ -23,7 +23,23 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (ffprobe, has_audio, duration_of, run_ffmpeg, load_json,
-                    keep_segments, encode_args, video_stream, clean_time, even)
+                    keep_segments, encode_args, video_stream, clean_time, even,
+                    compress_to_hevc)
+
+
+def _maybe_compress(out, args):
+    """Optional final pass: shrink the finished render to visually-lossless H.265."""
+    if not getattr(args, "compress", False):
+        return
+    print("»stage compress", flush=True)
+    res = compress_to_hevc(out)
+    if res:
+        before, after = res
+        pct = 100 * (1 - after / before)
+        print(f"compressed {before / 1e6:.1f}MB → {after / 1e6:.1f}MB "
+              f"({pct:.0f}% smaller, H.265)", flush=True)
+    else:
+        print("compression left the file as-is (already efficient)", flush=True)
 
 RECORDINGS = Path(__file__).resolve().parent.parent / "recordings"
 
@@ -175,6 +191,8 @@ def main():
     ap.add_argument("--input", default=None)
     ap.add_argument("--output", default=None)
     ap.add_argument("--quality", default="balanced", choices=["high", "balanced", "small"])
+    ap.add_argument("--compress", action="store_true",
+                    help="final visually-lossless H.265 pass to reduce file size")
     ap.add_argument("--format", dest="fmt", default="wide",
                     choices=["wide", "short", "square"])
     ap.add_argument("--layout", default="cam-top",
@@ -231,6 +249,7 @@ def main():
         if not keeps:
             sys.exit("nothing kept inside the selected range")
         n = cut_piece(src, keeps, fps, args.quality, audio, out)
+        _maybe_compress(out, args)
         print(f"clean video: {out} ({n:.1f}s of selection)", flush=True)
         return
 
@@ -311,6 +330,7 @@ def main():
 
     if not overlays and not music_ins:
         arranged.replace(out)
+        _maybe_compress(out, args)
         print(f"clean video: {out} ({duration_of(out):.1f}s)", flush=True)
         return
 
@@ -341,6 +361,7 @@ def main():
 
     if not norm and not mus:
         arranged.replace(out)
+        _maybe_compress(out, args)
         print(f"clean video: {out} ({duration_of(out):.1f}s)", flush=True)
         return
     print("»stage mix", flush=True)
@@ -443,6 +464,7 @@ def main():
         maps = ["-map", vprev.strip("[]").join(["[", "]"]), "-map", "[a]"]
         enc = encode_args(args.quality)
     run_ffmpeg(inputs + ["-filter_complex_script", script] + maps + enc + [str(out)])
+    _maybe_compress(out, args)
     print(f"clean video: {out} ({duration_of(out):.1f}s)", flush=True)
 
 

@@ -72,6 +72,51 @@ def encode_args(quality="balanced"):
     return video + ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
 
 
+_has_vt_hevc = None
+
+
+def hevc_args():
+    """Visually-lossless H.265 video encode (Apple hardware HEVC when present).
+    HEVC is ~40-50% more byte-efficient than H.264 at matched visual quality, so
+    it shrinks the file with no perceptible loss. Audio is copied, not re-encoded
+    (a second AAC pass would degrade it for no space win). The hvc1 tag keeps the
+    track playable in QuickTime / Finder / Safari."""
+    global _has_vt_hevc
+    if _has_vt_hevc is None:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                             capture_output=True, text=True).stdout
+        _has_vt_hevc = "hevc_videotoolbox" in out
+    if _has_vt_hevc:
+        video = ["-c:v", "hevc_videotoolbox", "-q:v", "60", "-pix_fmt", "yuv420p"]
+    else:
+        video = ["-c:v", "libx265", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p"]
+    return video + ["-tag:v", "hvc1", "-c:a", "copy", "-movflags", "+faststart"]
+
+
+def compress_to_hevc(path):
+    """Re-encode `path` in place to visually-lossless H.265, but KEEP the result
+    only when it is actually smaller (screen recordings already compress very well
+    in H.264, so HEVC doesn't always win — never make the file bigger). Returns
+    (before_bytes, after_bytes) when it compressed, else None (file untouched)."""
+    path = Path(path)
+    before = path.stat().st_size
+    tmp = path.with_name(path.stem + ".hevc" + path.suffix)
+    try:
+        run_ffmpeg(["-i", str(path)] + hevc_args() + [str(tmp)])
+    except Exception as e:
+        if tmp.exists():
+            tmp.unlink()
+        print(f"compression skipped ({e})", flush=True)
+        return None
+    after = tmp.stat().st_size if tmp.exists() else before
+    if after and after < before * 0.97:      # only worth it if ≥3% smaller
+        tmp.replace(path)
+        return (before, after)
+    if tmp.exists():
+        tmp.unlink()
+    return None
+
+
 def write_rounded_mask_png(path, w, h, radius_pct):
     """Grayscale PNG rounded-rect alpha mask, stdlib only (no PIL).
     radius_pct matches the CSS border-radius % from the recorder UI:
