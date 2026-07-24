@@ -1684,8 +1684,11 @@ $('ctxFromEdit').onclick = async e => {
   if (!sessions.length) { tlToast('no other recordings or edits found yet'); return; }
   picker.innerHTML = sessions.map(s => {
     const btns = [];
-    if (s.hasClean) btns.push(`<button class="mi" data-id="${esc(s.id)}" data-file="clean.mp4">✓ ${esc(s.title)} — clean edit</button>`);
-    if (s.hasComposite) btns.push(`<button class="mi" data-id="${esc(s.id)}" data-file="composite.mp4">${esc(s.title)} — full recording</button>`);
+    // prefer the name you gave the render (Renders page) over the raw folder id
+    const rn = s.renderNames || {};
+    const nameFor = (file, suffix) => `${esc(rn[file] || s.title)} — ${suffix}`;
+    if (s.hasClean) btns.push(`<button class="mi" data-id="${esc(s.id)}" data-file="clean.mp4">✓ ${nameFor('clean.mp4', 'clean edit')}</button>`);
+    if (s.hasComposite) btns.push(`<button class="mi" data-id="${esc(s.id)}" data-file="composite.mp4">${nameFor('composite.mp4', 'full recording')}</button>`);
     // raw recording, not composited yet: build it when picked
     if (!s.hasComposite && !s.hasClean && s.hasRaw)
       btns.push(`<button class="mi" data-id="${esc(s.id)}" data-file="composite.mp4" data-build="1">${esc(s.title)} — recording (prepares on add)</button>`);

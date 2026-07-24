@@ -112,6 +112,7 @@ async function listSessions() {
       files,
       createdAt: meta.createdAt || null,
       title: meta.title || e.name,
+      renderNames: meta.renderNames || {},
       hasComposite: files.includes('composite.mp4'),
       hasTranscript: files.includes('transcript.json'),
       hasClean: files.includes('clean.mp4'),
