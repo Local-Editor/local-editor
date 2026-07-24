@@ -221,8 +221,8 @@ body.wide .editor-grid { grid-template-columns: minmax(0, 54%) minmax(0, 46%); }
   background: #000; border-radius: var(--r-l);
 }
 .insert-player.editable:hover { outline: 1.5px solid #bf5af2; }
-/* transparent overlay clips: no letterbox plate behind the alpha */
-.insert-player.alpha { background: transparent; }
+/* transparent overlay clips: no plate, shadow, or rounding — the alpha is the shape */
+.insert-player.alpha { background: transparent; box-shadow: none; border-radius: 0; }
 .gap-cover {
   position: absolute; inset: 0; z-index: 5; background: #000;
   border-radius: var(--r-l);

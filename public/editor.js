@@ -2450,9 +2450,12 @@ function placeInsertFrame(ov) {
   const ar = (ip.videoWidth && ip.videoHeight) ? ip.videoWidth / ip.videoHeight : 16 / 9;
   const w = f.w * vw;
   const h = w / ar;
-  ip.style.cssText = `left:${vx + f.x * vw}px; top:${vy + f.y * vh}px;` +
-    `width:${w}px; height:${h}px; inset:auto; object-fit:cover;` +
-    (isAlphaIns(ov) ? 'background:transparent;'
+  // inset MUST come before left/top: it's a shorthand for top/right/bottom/left,
+  // so writing it after silently resets both and the clip lands at its static
+  // position outside the stage
+  ip.style.cssText = `inset:auto; left:${vx + f.x * vw}px; top:${vy + f.y * vh}px;` +
+    `width:${w}px; height:${h}px; object-fit:cover;` +
+    (isAlphaIns(ov) ? 'background:transparent; box-shadow:none; border-radius:0;'
       : 'border-radius:8px; box-shadow:0 6px 24px rgba(0,0,0,.5);');
 }
 $('insertPlayer').addEventListener('loadedmetadata', () => {
