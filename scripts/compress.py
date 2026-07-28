@@ -16,26 +16,55 @@ Usage: compress.py <session-dir>
 """
 import sys
 import json
+import subprocess
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import run_ffmpeg, duration_of, ffprobe, video_stream, hevc_args, load_json
+from common import duration_of, ffprobe, video_stream, hevc_args, load_json
 
 
 def _save_meta(d, meta):
     (d / "meta.json").write_text(json.dumps(meta, indent=2))
 
 
-def _compress_webm(src, dst):
+def _webm_args(src, dst):
     # VP9 keeps the .webm container valid for the rest of the pipeline; row-mt +
     # good deadline keep it a few x realtime. Opus audio copied (no re-encode).
-    run_ffmpeg(["-i", str(src), "-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0",
-                "-deadline", "good", "-cpu-used", "3", "-row-mt", "1",
-                "-c:a", "copy", str(dst)])
+    return ["-i", str(src), "-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0",
+            "-deadline", "good", "-cpu-used", "3", "-row-mt", "1",
+            "-c:a", "copy", str(dst)]
 
 
-def _compress_mp4(src, dst):
-    run_ffmpeg(["-i", str(src)] + hevc_args() + [str(dst)])
+def _mp4_args(src, dst):
+    return ["-i", str(src)] + hevc_args() + [str(dst)]
+
+
+def _run_ffmpeg(args, total_dur, k, total_files):
+    """Run ffmpeg and stream a clean '»fp k/N pct' line ~1%/step so the UI bar
+    moves even during a long encode. -nostats silences ffmpeg's spammy stderr;
+    -progress pipe:1 gives machine-readable position we turn into a percentage
+    (ffmpeg's own Duration line scrolls out of the log tail on big files)."""
+    print("+ ffmpeg " + " ".join(str(a) for a in args), flush=True)
+    proc = subprocess.Popen(
+        ["ffmpeg", "-hide_banner", "-y", "-nostats"] + args + ["-progress", "pipe:1"],
+        stdout=subprocess.PIPE, text=True, bufsize=1)
+    last = -1
+    for line in proc.stdout:
+        if line.startswith("out_time="):
+            v = line.split("=", 1)[1].strip()
+            if v and v != "N/A" and ":" in v:
+                try:
+                    hh, mm, ss = v.split(":")
+                    t = int(hh) * 3600 + int(mm) * 60 + float(ss)
+                except ValueError:
+                    continue
+                pct = min(99, int(t / total_dur * 100)) if total_dur > 0 else 0
+                if pct != last:
+                    last = pct
+                    print(f"»fp {k}/{total_files} {pct}", flush=True)
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg exited {proc.returncode}")
 
 
 def _is_hevc(f):
@@ -88,8 +117,9 @@ def main():
 
         dur0 = duration_of(f)
         tmp = f.with_name(f.stem + ".cmp" + f.suffix)
+        args = (_webm_args if kind == "webm" else _mp4_args)(f, tmp)
         try:
-            (_compress_webm if kind == "webm" else _compress_mp4)(f, tmp)
+            _run_ffmpeg(args, dur0, i, total)
         except Exception as e:
             if tmp.exists():
                 tmp.unlink()
