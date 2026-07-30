@@ -378,6 +378,12 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, started: 'compress-files' });
     }
 
+    if (p === '/api/proxy' && req.method === 'POST') {
+      const id = safeSession(url.searchParams.get('session'));
+      runJob(id, 'proxy', PYTHON, [path.join(SCRIPTS, 'proxy.py'), sessionDir(id)]);
+      return json(res, 200, { ok: true, started: 'proxy' });
+    }
+
     if (p === '/api/subsession' && req.method === 'POST') {
       const id = safeSession(url.searchParams.get('session'));
       const start = parseFloat(url.searchParams.get('start'));

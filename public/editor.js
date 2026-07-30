@@ -132,6 +132,7 @@ async function compressAllSessions() {
 
 // ---------- editor ----------
 let sessName = '';
+let sessFiles = [];   // this session's files (for proxy/webcam playback preferences)
 
 function applySessName() {
   $('sessTitle').textContent = sessName;
@@ -158,13 +159,17 @@ async function openSession() {
 
   const sessions = await (await fetch('/api/sessions')).json();
   const sess = sessions.find(s => s.id === sessionId) || { files: [] };
+  sessFiles = sess.files || [];
   sessName = sess.title || sessionId;
   applySessName();
   // Prefer the raw pair (instant, no waiting on ffmpeg): screen video with
   // the webcam played on top of it in the recorded layout. The composite is
-  // only used when the raw screen file is gone.
+  // only used when the raw screen file is gone. A 1080p H.264 preview proxy,
+  // when present, is played INSTEAD of the raw VP9 for smooth playback of
+  // high-res recordings (the raw is still used for the final render).
   if (sess.files.includes('screen.webm')) {
-    $('player').src = `/recordings/${sessionId}/screen.webm`;
+    const screenFile = sess.files.includes('proxy-screen.mp4') ? 'proxy-screen.mp4' : 'screen.webm';
+    $('player').src = `/recordings/${sessionId}/${screenFile}`;
     await fixWebmDuration($('player'));
     if (sess.files.includes('webcam.webm')) await setupCamOverlay();
   } else if (sess.files.includes('composite.mp4')) {
@@ -178,6 +183,8 @@ async function openSession() {
     $('dlClean').classList.remove('hidden');
     $('dlClean').href = `/recordings/${sessionId}/clean.mp4`;
   }
+  refreshProxyBar();
+  $('player').addEventListener('loadedmetadata', refreshProxyBar);
 
   const res = await fetch(`/api/transcript?session=${sessionId}`);
   if (!res.ok) {
@@ -219,6 +226,31 @@ async function refreshDownloadLinks() {
   if (scored) {
     $('dlMusic').classList.remove('hidden');
     $('dlMusic').href = `/recordings/${sessionId}/${scored}?t=${Date.now()}`;
+  }
+}
+
+// Preview proxy: a high-res VP9 screen capture stutters when played raw (browsers
+// only hardware-decode VP9 to ~1080p). Offer a one-click 1080p H.264 proxy the
+// editor plays instead; when a proxy is active, show a quiet confirmation.
+function refreshProxyBar() {
+  const bar = $('proxyBar'), player = $('player');
+  const usingProxy = (player.currentSrc || '').includes('proxy-screen.mp4');
+  const w = player.videoWidth || 0;
+  if (usingProxy) {
+    bar.className = 'proxy-bar ok';
+    bar.textContent = '⚡ Smooth preview active — the full-resolution recording is still used for rendering.';
+  } else if (sessFiles.includes('screen.webm') && !sessFiles.includes('proxy-screen.mp4') && w > 1920) {
+    bar.className = 'proxy-bar warn';
+    bar.innerHTML = `⚠ High-res recording (${w}px wide) — raw playback can stutter. ` +
+      `<button id="proxyBtn" class="btn btn-secondary">⚡ Generate smooth preview</button>`;
+    $('proxyBtn').onclick = async () => {
+      $('proxyBtn').disabled = true;
+      const j = await runJob('proxy');
+      if (j.status === 'done') { tlToast('⚡ smooth preview ready — reloading'); setTimeout(() => location.reload(), 800); }
+      else { $('proxyBtn').disabled = false; tlToast('preview build failed — see the job details'); }
+    };
+  } else {
+    bar.className = 'proxy-bar hidden';
   }
 }
 
@@ -266,7 +298,8 @@ async function setupCamOverlay() {
   camOffset = meta.webcamOffsetSec || 0;
 
   const cam = $('camVideo');
-  cam.src = `/recordings/${sessionId}/webcam.webm`;
+  const camFile = sessFiles.includes('proxy-webcam.mp4') ? 'proxy-webcam.mp4' : 'webcam.webm';
+  cam.src = `/recordings/${sessionId}/${camFile}`;
   await fixWebmDuration(cam);
   // only trust "no video track" when metadata actually loaded — a stalled
   // load (e.g. Chrome's 6-connections-per-host limit with several editor
@@ -852,7 +885,7 @@ $('undoAllBtn').onclick = () => {
 const JOB_LABELS = {
   render: 'Rendering clean video', transcribe: 'Transcribing', composite: 'Compositing',
   addmusic: 'Adding music', enhance: 'AI clean-up', subsession: 'Creating edit session',
-  'compress-files': 'Compressing edit files',
+  'compress-files': 'Compressing edit files', proxy: 'Building smooth preview',
 };
 
 // expected output length in seconds, used to turn ffmpeg/whisper logs into a %
@@ -866,8 +899,10 @@ function jobTarget(name) {
 }
 
 function jobPercent(name, tail) {
-  // multi-file jobs report "[k/N] file…" — progress by file count, not time
-  if (name === 'compress-files') {
+  // multi-file jobs stream "»fp k/N pct" (within-file %) — progress by file
+  if (name === 'compress-files' || name === 'proxy') {
+    const fp = [...tail.matchAll(/»fp (\d+)\/(\d+) (\d+)/g)].pop();
+    if (fp) return Math.max(1, Math.min(99, Math.round((+fp[1] - 1 + +fp[3] / 100) / +fp[2] * 100)));
     const m = [...tail.matchAll(/\[(\d+)\/(\d+)\]/g)].pop();
     if (!m) return null;
     return Math.max(1, Math.min(99, Math.round((+m[1] - 1) / +m[2] * 100)));
@@ -920,7 +955,8 @@ async function pollJob(name) {
       // pass so a restarting bar reads as progress, not a stuck render
       const STAGES = { composite: 'building the full composite', reframe: 'reframing',
                        cut: 'cutting the edit', mix: 'mixing music & overlays',
-                       denoise: 'removing background noise', compress: 'compressing to save space' };
+                       denoise: 'removing background noise', compress: 'compressing to save space',
+                       proxy: 'building smooth preview' };
       const stage = STAGES[j.stage] ? ` — ${STAGES[j.stage]}` : '';
       const pct = jobPercent(name, tail);
       if (pct !== null) {

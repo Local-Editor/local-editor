@@ -350,6 +350,16 @@ body.wide .transcript { max-height: calc(100vh - 360px); }
 .file-list .fsize + .tag { margin-left: 8px; }
 .tag-ok { background: rgba(48, 209, 88, 0.16); color: var(--green); }
 
+/* ---------- preview proxy bar ---------- */
+.proxy-bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin: 8px 0 2px; padding: 8px 12px; border-radius: var(--r-m);
+  font-size: 12.5px; line-height: 1.4;
+}
+.proxy-bar.warn { background: rgba(255, 159, 10, 0.12); color: var(--text); border: 1px solid rgba(255, 159, 10, 0.28); }
+.proxy-bar.ok { background: rgba(48, 209, 88, 0.12); color: var(--text-2); border: 1px solid rgba(48, 209, 88, 0.22); }
+.proxy-bar .btn { margin-left: auto; padding: 4px 12px; }
+
 /* ---------- timeline dock ---------- */
 .timeline-bar {
   position: fixed; left: 16px; right: 16px; bottom: 14px; z-index: 40;
