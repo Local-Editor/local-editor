@@ -704,7 +704,8 @@ $('renderBtn').onclick = async () => {
     const [format, layout] = ($('renderFormat').value + '|cam-top').split('|');
     const quality = $('renderQuality').value;
     const compress = $('renderCompress').checked ? '&compress=1' : '';
-    j = await runJob('render', `&quality=${quality}&format=${format}&layout=${layout}${compress}`);
+    const denoise = $('renderDenoise').checked ? '&denoise=1' : '';
+    j = await runJob('render', `&quality=${quality}&format=${format}&layout=${layout}${compress}${denoise}`);
   } finally {
     $('renderBtn').disabled = false;
   }
@@ -919,7 +920,7 @@ async function pollJob(name) {
       // pass so a restarting bar reads as progress, not a stuck render
       const STAGES = { composite: 'building the full composite', reframe: 'reframing',
                        cut: 'cutting the edit', mix: 'mixing music & overlays',
-                       compress: 'compressing to save space' };
+                       denoise: 'removing background noise', compress: 'compressing to save space' };
       const stage = STAGES[j.stage] ? ` — ${STAGES[j.stage]}` : '';
       const pct = jobPercent(name, tail);
       if (pct !== null) {
@@ -2322,6 +2323,7 @@ $('txRenderPart').onclick = async () => {
   await saveTranscript();
   const j = await runJob('render', `&quality=${$('renderQuality').value}&format=wide` +
     ($('renderCompress').checked ? '&compress=1' : '') +
+    ($('renderDenoise').checked ? '&denoise=1' : '') +
     `&rstart=${range[0].toFixed(2)}&rend=${range[1].toFixed(2)}`);
   if (j.status === 'done') {
     $('dlClean').classList.remove('hidden');

@@ -63,6 +63,9 @@
           <label class="toggle" title="Re-encode the finished video to H.265 — visually identical, ~40–50% smaller. Plays in QuickTime/Safari and modern Chrome on Mac.">
             <input type="checkbox" id="renderCompress"> Compress to save space
           </label>
+          <label class="toggle" title="Strip steady background noise (fans, hum, hiss, room tone) from the voice with RNNoise, keeping just the speaker. Applied to your voice only — music beds are untouched.">
+            <input type="checkbox" id="renderDenoise"> Remove background noise
+          </label>
           <button id="renderBtn" class="btn">Render clean video</button>
         </div>
         <div class="controls-row">

@@ -344,6 +344,7 @@ const server = http.createServer(async (req, res) => {
       const renderArgs = [path.join(SCRIPTS, 'render.py'), sessionDir(id),
         '--quality', quality, '--format', format, '--layout', layout];
       if (url.searchParams.get('compress') === '1') renderArgs.push('--compress');
+      if (url.searchParams.get('denoise') === '1') renderArgs.push('--denoise');
       const rstart = parseFloat(url.searchParams.get('rstart'));
       const rend = parseFloat(url.searchParams.get('rend'));
       if (isFinite(rstart) && isFinite(rend) && rend > rstart) {
