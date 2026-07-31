@@ -67,6 +67,60 @@ def detect_gap_sounds(wav_path, words, min_gap=0.3, min_run=0.18):
     return markers
 
 
+def _rms_envelope(path, hop_ms=10):
+    """16 kHz mono RMS envelope, one value per hop_ms — a cheap, robust
+    fingerprint for aligning two renderings of the same voice."""
+    import numpy as np
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = Path(tmp) / "env.wav"
+        subprocess.run(["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", str(path),
+                        "-vn", "-ac", "1", "-ar", "16000", str(wav)], check=True)
+        with wave.open(str(wav)) as wf:
+            pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+    audio = pcm.astype(np.float32) / 32768.0
+    hop = int(16000 * hop_ms / 1000)
+    n = len(audio) // hop
+    return np.sqrt((audio[:n * hop].reshape(n, hop) ** 2).mean(axis=1))
+
+
+def measure_offset(source, composite, fallback, max_lag=3.0):
+    """SOURCE time -> COMPOSITE time, measured from the audio itself.
+
+    meta.json's webcamOffsetSec is only the recorder's start-time estimate, and
+    the composite on disk can disagree with it (it may predate a re-record, or
+    the webm decode may have swallowed a corrupt leading packet). render.py cuts
+    the composite, so the composite is the timeline that matters — align to it
+    directly and fall back to meta only when the match is weak."""
+    try:
+        import numpy as np
+    except ImportError:
+        return fallback, "numpy missing"
+    try:
+        es, ec = _rms_envelope(source), _rms_envelope(composite)
+    except Exception as e:
+        return fallback, f"probe failed ({e})"
+    lim = 100 * max_lag                       # lag search radius, in 10 ms frames
+    n = min(len(es), len(ec))
+    if n < 3000:                              # under 30 s: not enough to be sure
+        return fallback, "clip too short to measure"
+    win = min(6000, n // 2)                   # a 60 s slice, taken from the middle
+    st = (n - win) // 2                       # where speech is dense, not the silent head
+    a = es[st:st + win] - es[st:st + win].mean()
+    lo, hi = max(0, st - int(lim)), min(len(ec), st + win + int(lim))
+    b = ec[lo:hi] - ec[lo:hi].mean()
+    if len(b) < len(a) + 2 or not a.any() or not b.any():
+        return fallback, "not enough signal"
+    c = np.correlate(b, a, mode="valid")
+    k = int(c.argmax())
+    score = float(c[k]) / (np.linalg.norm(a) * np.linalg.norm(b[k:k + win]) + 1e-9)
+    lag = (k + lo - st) * 0.01               # frames -> seconds
+    if score < 0.3:
+        return fallback, f"weak match (score {score:.2f})"
+    if abs(lag) > max_lag:
+        return fallback, f"implausible lag ({lag:+.2f}s)"
+    return round(lag, 3), f"measured (score {score:.2f})"
+
+
 def pick_audio_source(d: Path, meta: dict):
     """Timestamps must live on the COMPOSITE timeline (what the editor plays).
     composite.py anchors that timeline to the SCREEN recorder's start, so a
@@ -95,6 +149,10 @@ def main():
     d = Path(args.session_dir)
     meta = load_json(d / "meta.json", {})
     source, offset = pick_audio_source(d, meta)
+    comp = d / "composite.mp4"
+    if source.name != comp.name and comp.exists():
+        offset, how = measure_offset(source, comp, offset)
+        print(f"source->composite offset {offset:+.3f}s — {how}", flush=True)
     print(f"transcribing {source.name} (offset {offset:+.3f}s) with model={args.model}", flush=True)
 
     with tempfile.TemporaryDirectory() as tmp:

@@ -16,7 +16,46 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (ffprobe, video_stream, has_audio, duration_of,
                     run_ffmpeg, even, write_rounded_mask_png, load_json,
-                    encode_args)
+                    encode_args, normalize_audio_timeline)
+
+
+# Rewrite audio timestamps so they follow the SAMPLES, one after another.
+#
+# Load-bearing for cutting. render.py selects keep-spans with atrim/select,
+# which address audio by TIMESTAMP, while transcribe.py reads the mic by
+# decoding it start-to-finish, which addresses it by SAMPLE ORDER. Those two
+# only agree while the timestamps stay continuous — and encoding this graph can
+# leave the composite's audio timestamps running ~1.2s behind its samples, so
+# every cut landed ~1.2s late and sliced the opening words off the render.
+# The raw webcam.webm is sample-continuous, so re-deriving timestamps from the
+# sample count loses nothing and keeps the two addressing schemes identical.
+SEQ_PTS = "asetpts=N/SR/TB"
+
+
+def mic_chain(idx, trim_s, delay_ms, out_label):
+    """Mic -> the composite's timeline, read from input `idx`.
+
+    That index matters: see mic_input(). Everything else here is the plain
+    start-skew correction — trim the head when the webcam recorder started
+    first, delay it when it started second."""
+    return (f"[{idx}:a]atrim=start={trim_s:.3f},asetpts=PTS-STARTPTS,"
+            f"adelay={delay_ms}|{delay_ms},{SEQ_PTS}{out_label}")
+
+
+def mic_input(webcam, n_inputs):
+    """Give the mic its OWN input handle, appended after `n_inputs` existing ones.
+
+    This is not redundancy. Pulling both streams of one MediaRecorder webm
+    through a single input handle desynchronises the audio: on a real 3-minute
+    recording the voice landed ~0.48s ahead of where the start-skew says it
+    should, so every render had the voice and the webcam bubble running ahead
+    of the screen — and transcript-driven cuts sliced off the opening words.
+    Decoding the webcam's video and its audio through separate input handles
+    restores exact alignment (verified against the recorder's measured skew).
+
+    Appending at the END keeps every earlier input index — and so the mask
+    indices in the overlay chain — unchanged."""
+    return n_inputs, ["-i", str(webcam)]
 
 
 def main(session_dir):
@@ -37,6 +76,7 @@ def main(session_dir):
             if not has_audio(w_info):
                 args += ["-an"]
             run_ffmpeg(args + encode_args() + [str(out)])
+            normalize_audio_timeline(out)
             print(f"composite done (webcam only): {out}")
             return
         sys.exit("no screen.webm or webcam.webm in session")
@@ -52,6 +92,7 @@ def main(session_dir):
         if not screen_audio:
             args += ["-an"]
         run_ffmpeg(args + encode_args() + [str(out)])
+        normalize_audio_timeline(out)
         print(f"composite done (screen only): {out}")
         return
 
@@ -65,20 +106,20 @@ def main(session_dir):
         trim_s = max(0.0, -off)
         graph = f"[0:v]scale={even(sw)}:{even(sh)},fps=30[v]"
         audio_map = []
+        # no webcam VIDEO here, so input 1 can safely carry the mic audio
         if webcam_audio and screen_audio:
-            graph += (f";[1:a]atrim=start={trim_s:.3f},asetpts=PTS-STARTPTS,"
-                      f"adelay={delay_ms}|{delay_ms}[mic]"
-                      f";[0:a][mic]amix=inputs=2:duration=longest:weights=0.6 1.0[a]")
+            graph += (f";{mic_chain(1, trim_s, delay_ms, '[mic]')}"
+                      f";[0:a][mic]amix=inputs=2:duration=longest:weights=0.6 1.0,asetpts=N/SR/TB[a]")
             audio_map = ["-map", "[a]"]
         elif webcam_audio:
-            graph += (f";[1:a]atrim=start={trim_s:.3f},asetpts=PTS-STARTPTS,"
-                      f"adelay={delay_ms}|{delay_ms}[a]")
+            graph += f";{mic_chain(1, trim_s, delay_ms, '[a]')}"
             audio_map = ["-map", "[a]"]
         elif screen_audio:
             audio_map = ["-map", "0:a"]
         run_ffmpeg(["-i", str(screen), "-i", str(webcam),
                     "-filter_complex", graph, "-map", "[v]"] + audio_map
                    + ([] if audio_map else ["-an"]) + encode_args() + [str(out)])
+        normalize_audio_timeline(out)
         print(f"composite done (screen + mic): {out} ({duration_of(out):.1f}s)")
         return
 
@@ -95,8 +136,12 @@ def main(session_dir):
     delay_ms = max(0, int(round(off * 1000)))          # webcam started later -> delay it
     trim_s = max(0.0, -off)                            # webcam started earlier -> trim its head
 
-    sync = (f"trim=start={trim_s:.3f},setpts=PTS-STARTPTS"
-            + (f"+{off:.3f}/TB" if off > 0.001 else ""))
+    # The webcam VIDEO is aligned at the INPUT (-itsoffset below), not with a
+    # trim/setpts pair in the graph. `trim=start=N,setpts=PTS-STARTPTS` looks
+    # equivalent but silently mis-rebases here: measured against the source, it
+    # put the bubble 1.5s ahead of where the skew asks for, so the face ran
+    # ahead of the voice in every render. -itsoffset lands it exactly.
+    cam_offset_in = ["-itsoffset", f"{off:.3f}"]
 
     # Per-piece bubble placement: each scissor piece of footage can carry its
     # own bubble position/size (sg["cam"]). Uncovered source time = base layout.
@@ -119,7 +164,7 @@ def main(session_dir):
 
     mask_inputs = []
     parts = [f"[0:v]scale={even(sw)}:{even(sh)},fps=30[scr]",
-             f"[1:v]{sync}[camsync]",
+             "[1:v]null[camsync]",
              f"[camsync]split={len(intervals)}" +
              "".join(f"[c{i}]" for i in range(len(intervals)))]
     prev = "[scr]"
@@ -145,25 +190,29 @@ def main(session_dir):
     cam_chain = ";".join(parts)
 
     # Audio: mic (webcam) is primary; mix in system audio when present.
+    # The webcam's VIDEO is decoded above, so the mic gets its own input handle.
     audio_chain = ""
     audio_map = []
-    if webcam_audio and screen_audio:
-        audio_chain = (
-            f";[1:a]atrim=start={trim_s:.3f},asetpts=PTS-STARTPTS,adelay={delay_ms}|{delay_ms}[mic]"
-            f";[0:a][mic]amix=inputs=2:duration=longest:weights=0.6 1.0[a]"
-        )
-        audio_map = ["-map", "[a]"]
-    elif webcam_audio:
-        audio_chain = (
-            f";[1:a]atrim=start={trim_s:.3f},asetpts=PTS-STARTPTS,adelay={delay_ms}|{delay_ms}[a]"
-        )
+    mic_extra = []
+    if webcam_audio:
+        mic_i, mic_extra = mic_input(webcam, 2 + len(intervals))
+        if screen_audio:
+            audio_chain = (
+                f";{mic_chain(mic_i, trim_s, delay_ms, '[mic]')}"
+                f";[0:a][mic]amix=inputs=2:duration=longest:weights=0.6 1.0,asetpts=N/SR/TB[a]"
+            )
+        else:
+            audio_chain = f";{mic_chain(mic_i, trim_s, delay_ms, '[a]')}"
         audio_map = ["-map", "[a]"]
     elif screen_audio:
         audio_map = ["-map", "0:a"]
 
-    args = ["-i", str(screen), "-i", str(webcam)] + mask_inputs +            ["-filter_complex", cam_chain + audio_chain,
+    args = ["-i", str(screen)] + cam_offset_in + ["-i", str(webcam)] \
+           + mask_inputs + mic_extra + \
+           ["-filter_complex", cam_chain + audio_chain,
             "-map", "[v]"] + audio_map + (["-an"] if not audio_map else [])
     run_ffmpeg(args + encode_args() + [str(out)])
+    normalize_audio_timeline(out)
     # sidecar so render.py knows which bubble placements this composite used
     sig = [[round(float(sg["s0"]), 2), round(float(sg["s1"]), 2), sg["cam"]]
            for sg in cam_segs]

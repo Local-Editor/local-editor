@@ -21,7 +21,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (ffprobe, video_stream, has_audio, duration_of, run_ffmpeg,
-                    even, write_rounded_mask_png, load_json, encode_args)
+                    even, write_rounded_mask_png, load_json, encode_args,
+                    normalize_audio_timeline)
+from composite import mic_chain, mic_input
 
 CANVAS = {"short": (1080, 1920), "square": (1080, 1080)}
 
@@ -56,13 +58,15 @@ def main():
     off = float(meta.get("webcamOffsetSec", 0.0))
     delay_ms = max(0, int(round(off * 1000)))
     trim_s = max(0.0, -off)
-    cam_sync = (f"trim=start={trim_s:.3f},setpts=PTS-STARTPTS"
-                + (f"+{off:.3f}/TB" if off > 0.001 else ""))
+    # webcam VIDEO is aligned at the INPUT, not with trim/setpts in the graph —
+    # that pair mis-rebases and puts the face ~1.5s ahead of the voice
+    # (see composite.py). Audio still uses trim_s/delay_ms via mic_chain.
+    cam_offset_in = ["-itsoffset", f"{off:.3f}"]
     mirror = ",hflip" if layout.get("mirror", True) else ""
 
     inputs = ["-i", str(screen)]
     if have_cam:
-        inputs += ["-i", str(webcam)]
+        inputs += cam_offset_in + ["-i", str(webcam)]
 
     if not have_cam:
         graph = f"[0:v]{fill('', W, H)},fps=30[v]"
@@ -74,7 +78,7 @@ def main():
         inputs += ["-loop", "1", "-i", str(mask)]
         graph = (
             f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30[scr];"
-            f"[1:v]{cam_sync},scale={cam_w}:{cam_h}:force_original_aspect_ratio=increase,"
+            f"[1:v]scale={cam_w}:{cam_h}:force_original_aspect_ratio=increase,"
             f"crop={cam_w}:{cam_h}{mirror}[cam];"
             f"[2:v]format=gray[m];[cam][m]alphamerge[cama];"
             f"[scr][cama]overlay={W - cam_w - 40}:{H - cam_h - 40}:eof_action=pass[v]"
@@ -82,7 +86,7 @@ def main():
     else:
         half = even(H / 2)
         cam_first = args.layout == "cam-top"
-        cam_chain = (f"[1:v]{cam_sync},scale={W}:{half}:force_original_aspect_ratio=increase,"
+        cam_chain = (f"[1:v]scale={W}:{half}:force_original_aspect_ratio=increase,"
                      f"crop={W}:{half}{mirror}[camh]")
         scr_chain = (f"[0:v]scale={W}:{half}:force_original_aspect_ratio=increase,"
                      f"crop={W}:{half}[scrh]")
@@ -94,14 +98,17 @@ def main():
     screen_audio = has_audio(ffprobe(screen))
     webcam_audio = have_cam and has_audio(ffprobe(webcam))
     audio_map = []
-    if webcam_audio and screen_audio:
-        graph += (f";[1:a]atrim=start={trim_s:.3f},asetpts=PTS-STARTPTS,"
-                  f"adelay={delay_ms}|{delay_ms}[mic]"
-                  f";[0:a][mic]amix=inputs=2:duration=longest:weights=0.6 1.0[a]")
-        audio_map = ["-map", "[a]"]
-    elif webcam_audio:
-        graph += (f";[1:a]atrim=start={trim_s:.3f},asetpts=PTS-STARTPTS,"
-                  f"adelay={delay_ms}|{delay_ms}[a]")
+    if webcam_audio:
+        # the webcam's VIDEO is decoded above — the mic needs its own input
+        # handle or the voice drifts ahead of the picture (see mic_input)
+        n_inputs = 1 + (1 if have_cam else 0) + (1 if args.layout == "overlay" else 0)
+        mic_i, mic_extra = mic_input(webcam, n_inputs)
+        inputs += mic_extra
+        if screen_audio:
+            graph += (f";{mic_chain(mic_i, trim_s, delay_ms, '[mic]')}"
+                      f";[0:a][mic]amix=inputs=2:duration=longest:weights=0.6 1.0,asetpts=N/SR/TB[a]")
+        else:
+            graph += f";{mic_chain(mic_i, trim_s, delay_ms, '[a]')}"
         audio_map = ["-map", "[a]"]
     elif screen_audio:
         audio_map = ["-map", "0:a"]
@@ -109,6 +116,7 @@ def main():
     run_ffmpeg(inputs + ["-filter_complex", graph, "-map", "[v]"] + audio_map
                + ([] if audio_map else ["-an"])
                + encode_args(args.quality) + [str(out)])
+    normalize_audio_timeline(out)
     print(f"reframed: {out} ({duration_of(out):.1f}s, {W}x{H}, {args.layout})")
     return out
 

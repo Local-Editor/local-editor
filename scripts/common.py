@@ -147,6 +147,38 @@ def write_rounded_mask_png(path, w, h, radius_pct):
     Path(path).write_bytes(png)
 
 
+def normalize_audio_timeline(path):
+    """Rewrite `path`'s audio so its TIMESTAMPS follow its SAMPLES exactly.
+
+    The two ways this pipeline addresses audio have to agree. render.py picks
+    keep-spans with atrim/select, which address audio by timestamp, while
+    transcribe.py reads the mic by decoding it straight through, which
+    addresses it by sample order. Encoding a composite can leave those
+    disagreeing — measured on a real recording, the finished composite's audio
+    timestamps ran 1.2s behind its samples, so every cut landed 1.2s late and
+    the render lost its opening words ("Hey Ian, I figured…").
+
+    Round-tripping the audio through PCM rebuilds a stream where the two are
+    identical. The video is stream-copied, so this costs a file pass and no
+    picture quality. Idempotent — safe to run on an already-clean file."""
+    p = Path(path)
+    if not has_audio(ffprobe(p)):
+        return
+    pcm = p.with_name(p.stem + ".autmp.wav")
+    fixed = p.with_name(p.stem + ".autmp.mp4")
+    try:
+        run_ffmpeg(["-i", str(p), "-vn", "-c:a", "pcm_s16le",
+                    "-ar", "48000", "-ac", "2", str(pcm)])
+        run_ffmpeg(["-i", str(p), "-i", str(pcm), "-map", "0:v", "-map", "1:a",
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart", str(fixed)])
+        fixed.replace(p)
+    finally:
+        for t in (pcm, fixed):
+            if t.exists():
+                t.unlink()
+
+
 def load_json(path, default=None):
     p = Path(path)
     if not p.exists():
