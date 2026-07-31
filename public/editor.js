@@ -288,6 +288,7 @@ function fixWebmDuration(v) {
 let camOffset = 0; // webcam recorder started this many seconds AFTER the screen one
 let camLayout = null;   // layout.json (recorder-arranged bubble)
 let camAvailable = false;
+let camAudio = null;    // separate <audio> for the voice (see the Bluetooth fix below)
 
 async function setupCamOverlay() {
   const [layout, meta] = await Promise.all([
@@ -299,8 +300,23 @@ async function setupCamOverlay() {
 
   const cam = $('camVideo');
   const camFile = sessFiles.includes('proxy-webcam.mp4') ? 'proxy-webcam.mp4' : 'webcam.webm';
-  cam.src = `/recordings/${sessionId}/${camFile}`;
+  const camUrl = `/recordings/${sessionId}/${camFile}`;
+  cam.src = camUrl;
+  // BLUETOOTH FIX: a <video> that outputs audio has its FRAMES slaved to the audio
+  // output clock — over Bluetooth that clock is high-latency and jittery, so the
+  // webcam bubble stutters while the audio itself stays smooth (the screen video
+  // has no audio, which is why it never stutters). So play the webcam VIDEO muted —
+  // it then renders on the system clock, smooth — and route the VOICE through a
+  // separate <audio> element, where Bluetooth handles it fine.
+  cam.muted = true;
   await fixWebmDuration(cam);
+
+  if (!camAudio) { camAudio = document.createElement('audio'); document.body.appendChild(camAudio); }
+  camAudio.src = camUrl;
+  camAudio.muted = false;
+  camAudio.volume = 1;
+  await fixWebmDuration(camAudio);
+
   // only trust "no video track" when metadata actually loaded — a stalled
   // load (e.g. Chrome's 6-connections-per-host limit with several editor
   // tabs open) must not disable the bubble
@@ -320,20 +336,28 @@ async function setupCamOverlay() {
 
   const player = $('player');
 
-  // Screen video is the master; the webcam follows it.
-  const syncTime = () => { cam.currentTime = Math.max(0, player.currentTime - camOffset); };
-  player.addEventListener('play', () => { syncTime(); cam.play().catch(() => {}); });
-  player.addEventListener('pause', () => { cam.pause(); syncTime(); });
+  // Screen video is the master; the webcam VIDEO (muted) and the VOICE audio follow it.
+  const syncTime = () => {
+    const t = Math.max(0, player.currentTime - camOffset);
+    cam.currentTime = t;
+    camAudio.currentTime = t;
+  };
+  player.addEventListener('play', () => {
+    syncTime();
+    cam.play().catch(() => {});
+    camAudio.play().catch(() => {});
+  });
+  player.addEventListener('pause', () => { cam.pause(); camAudio.pause(); syncTime(); });
   player.addEventListener('seeked', syncTime);
-  player.addEventListener('ratechange', () => { cam.playbackRate = player.playbackRate; });
+  player.addEventListener('ratechange', () => {
+    cam.playbackRate = camAudio.playbackRate = player.playbackRate;
+  });
   player.addEventListener('timeupdate', () => {
     if (player.paused) return;
     const want = player.currentTime - camOffset;
     if (Math.abs(cam.currentTime - want) > 0.2) cam.currentTime = Math.max(0, want);
+    if (Math.abs(camAudio.currentTime - want) > 0.2) camAudio.currentTime = Math.max(0, want);
   });
-  // Mic audio lives on the webcam file — make sure it's audible.
-  cam.muted = false;
-  cam.volume = 1;
 }
 
 // ---------- per-piece webcam bubble: cut the footage, then set the bubble
