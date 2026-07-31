@@ -68,14 +68,19 @@ def detect_gap_sounds(wav_path, words, min_gap=0.3, min_run=0.18):
 
 
 def pick_audio_source(d: Path, meta: dict):
-    """Timestamps must live on the COMPOSITE timeline (what the editor plays),
-    so if the webcam recorder started later we shift by its offset."""
+    """Timestamps must live on the COMPOSITE timeline (what the editor plays).
+    composite.py anchors that timeline to the SCREEN recorder's start, so a
+    webcam moment at T lands at T + webcamOffsetSec. The offset is SIGNED and
+    both signs matter: positive means the webcam recorder started later and
+    composite.py delays its head; negative means it started earlier and
+    composite.py TRIMS that much off its head. Clamping this to >= 0 leaves
+    every word late by |offset| and the render cuts off the opening words."""
     for name, offset in [("webcam.webm", float(meta.get("webcamOffsetSec", 0.0))),
                          ("composite.mp4", 0.0),
                          ("screen.webm", 0.0)]:
         f = d / name
         if f.exists():
-            return f, max(0.0, offset)
+            return f, offset
     sys.exit("no media found in session")
 
 
@@ -114,8 +119,8 @@ def main():
             for w in seg.words or []:
                 words.append({
                     "w": w.word.strip(),
-                    "start": round(w.start + offset, 3),
-                    "end": round(w.end + offset, 3),
+                    "start": round(w.start, 3),
+                    "end": round(w.end, 3),
                     "removed": False,
                     "reason": None,
                     "edited": False,
@@ -123,13 +128,21 @@ def main():
                 })
             print(f"  [{seg.start:7.2f}s] {seg.text.strip()}", flush=True)
 
+        # the gap scan indexes into `wav`, so it must run on the SOURCE
+        # timeline — shift everything to composite time afterwards
         markers = detect_gap_sounds(wav, words)
         if markers:
-            for m in markers:
-                m["start"] += offset
-                m["end"] += offset
             words = sorted(words + markers, key=lambda w: w["start"])
             print(f"gap-sound safety net: {len(markers)} unheard-audio '(um?)' markers added")
+
+    if abs(offset) > 0.001:
+        # source timeline -> composite timeline; a negative offset means the
+        # head of this audio was trimmed away and never reaches the composite
+        words = [w for w in words if w["end"] + offset > 0]
+        for w in words:
+            w["start"] = round(max(0.0, w["start"] + offset), 3)
+            w["end"] = round(max(0.0, w["end"] + offset), 3)
+        print(f"shifted {len(words)} words by {offset:+.3f}s onto the composite timeline")
 
     composite = d / "composite.mp4"
     duration = duration_of(composite if composite.exists() else source)
