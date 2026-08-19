@@ -28,6 +28,17 @@ editor's music dropdown has anything in it):
 .venv/bin/python3 scripts/music.py starter
 ```
 
+Optional: **rclone**, only for the Google Drive archive (Edit/Renders tabs).
+Don't install it unprompted — it's off by default and nothing else uses it.
+If the user asks for the archive, check `rclone listremotes` first; `rclone
+config` is interactive (browser OAuth), so hand that step to the user rather
+than trying to drive it:
+
+```bash
+brew install rclone      # apt install rclone · winget install Rclone.Rclone
+rclone config            # user does this — add a Drive remote named "gdrive"
+```
+
 Notes:
 - The Whisper model (~500MB for `small`) auto-downloads on the first
   transcription — warn the user the first run is slow.
@@ -44,8 +55,32 @@ Notes:
   (`editor.html`+`editor.js`), renders gallery (`renders.html`). No build step.
 - `scripts/` — Python pipeline: `composite.py` → `transcribe.py` →
   `enhance.py` → `render.py` (+ `reframe.py`, `addmusic.py`, `music.py`,
-  `subsession.py`, `subtitles.py`, `migrate_edits.py`, shared helpers in
-  `common.py`).
+  `subsession.py`, `subtitles.py`, `migrate_edits.py`, `archive.py`, shared
+  helpers in `common.py`).
+- `scripts/archive.py` moves media to Google Drive via rclone and back, either a
+  whole session (Edit tab) or single files (`--files`, used by the Renders
+  page). Four rules it must keep: **verify before deleting** (`rclone check`
+  passes, then the local files go), **write `meta.json['archive']` before
+  unlinking** (a crash mid-delete must still know where the media went),
+  **merge, never replace, `archive.files`** (archiving a session after one
+  render was archived alone must not forget that render — it would orphan the
+  Drive copy), and **only media moves** — the sidecars stay so the session is
+  still listed and its edit survives. `archive.files` is a per-file map
+  `{name: {size, at}}`; a session is *fully* archived only when that map is
+  non-empty AND no media is left on disk (`archive.whole` in `/api/sessions`),
+  which is what gates the editor's offline banner. Partly-archived sessions must
+  keep playing and rendering. rclone needs `--stats-log-level NOTICE` or the
+  progress line never appears (stats log at INFO, default level is NOTICE) —
+  don't reach for `-v`, the INFO flood has starved a transfer here before.
+  Settings live in `archive-config.json` (gitignored); the auto-sweep runs from
+  `server.js` on a 30-min timer and is off until switched on. Two cutoffs, two
+  scopes: `olderThanDays` drives the Edit tab's automatic whole-recording sweep
+  (**all** media, raw `screen.webm`/`webcam.webm` included), while
+  `rendersOlderThanDays` drives the Renders page's manual bulk button, which
+  only ever touches `renderKind()` outputs and leaves raw footage alone. The
+  bulk button groups eligible files **by session** before calling `/api/archive`
+  — one job runs per session, so two renders in one recording must go in a
+  single `--files` pass or the second request is rejected.
 - `recordings/<session>/transcript.json` is the single source of truth for an
   edit. Raw `screen.webm`/`webcam.webm` are never modified by anything.
 - `keep_segments()` in `scripts/common.py` mirrors `keepSegments()` in

@@ -17,6 +17,15 @@ python3 -m venv .venv
 npm start                                   # → open http://localhost:4321 in Chrome
 ```
 
+Optional — only if you want the **Google Drive archive** (moving old recordings
+off your disk, see below). Nothing else needs it, and it stays off until you
+switch it on:
+
+```bash
+brew install rclone      # apt install rclone · winget install Rclone.Rclone
+rclone config            # add a Google Drive remote, name it "gdrive"
+```
+
 Or just open this folder in [Claude Code](https://claude.com/claude-code) and
 say **"set this up"** — `CLAUDE.md` walks it through everything, and the
 bundled `screen-studio` skill automates the whole record → transcribe →
@@ -116,8 +125,63 @@ Left = video preview + controls. Right = the **transcript**. Bottom = the
 ## 3 · Renders  (`/renders.html`)
 
 Every finished video across all sessions, newest first, with previews +
-downloads. ⋮ menu to rename or delete. Double-click a name to rename the
-recording (applies everywhere) or a specific render.
+downloads. ⋮ menu to rename, archive or delete. Double-click a name to rename
+the recording (applies everywhere) or a specific render.
+
+**☁ Archive to Google Drive** in the ⋮ menu moves that one finished video to
+Drive and frees the space — handy once a render is delivered but you don't want
+to throw it away. The card stays on the page as a cloud placeholder with
+**⬇ Restore from Drive**; deleting an archived card removes the Drive copy too.
+
+The bar at the top does it in bulk: **☁ Archive renders older than N day(s)**
+(7 by default) counts what qualifies, and one button clears the lot with a live
+% bar. Renders in the same recording go up in a single pass.
+
+Both only ever touch **finished renders** — `clean*.mp4`, `*-music.mp4`,
+`composite.mp4`, `asset-*`. The raw `screen.webm` / `webcam.webm` they came from
+are never archived from this page; use the Edit tab for those.
+
+---
+
+## ☁ Google Drive archive
+
+Recordings pile up fast. The panel at the top of the **Edit** tab moves old ones
+to Google Drive with [rclone](https://rclone.org/) and frees the space here —
+while keeping every recording listed and one click from editable again.
+
+- **☁ Archive** on any row uploads that recording's video, **verifies it on
+  Drive**, then deletes the local copy. Only the media moves: `transcript.json`,
+  `meta.json`, `layout.json` and the masks stay put, so the session keeps its
+  title, its transcript and all your cuts.
+- Single files can go too — see the ⋮ menu on the **Renders** page. A recording
+  with only some files on Drive shows `☁ 2 on Drive` and still plays and renders
+  normally; **⬇ Restore** fetches back everything it has up there.
+- **⬇ Restore** downloads the video back and the session is fully editable
+  again. Opening an archived recording shows the same offer as a banner over the
+  player, with rendering disabled until the footage is back.
+- **Auto-archive** (off by default) sweeps every 30 minutes and archives any
+  recording whose video has sat untouched longer than the cutoff — 1 day out of
+  the box, editable in the box next to the toggle. Re-rendering or re-recording
+  resets that clock for the whole session.
+- Progress is a live % bar: overall across the batch, plus the current
+  recording's own upload percentage and stage.
+
+Setup is the optional rclone step from the top of this README — a remote named
+`gdrive`. Without it the panel just reports that rclone isn't configured, and
+nothing else in the app is affected.
+
+Files land in `gdrive:Local Editor Archive/<session>/`. Change the remote (or
+the cutoff) in `archive-config.json`, written next to `server.js` the first time
+you touch the settings. Uploads run one file at a time with retries, so each
+finished file is committed to Drive before the next starts.
+
+Restoring leaves the Drive copy in place rather than deleting it — a restored
+recording is still backed up, and re-archiving it later just overwrites. Use
+**Delete render** (or `rclone delete`) if you want the Drive space back.
+
+Two things are deliberately never archived automatically: recordings newer than
+the cutoff, and any recording another session pulls a timeline **insert** from —
+archiving those would pull footage out from under an edit that is still using it.
 
 ---
 
@@ -137,7 +201,7 @@ server.js            zero-dependency Node server (UI, uploads, ffmpeg jobs)
 public/              record + edit + renders UI (no build step)
 scripts/             composite · transcribe · enhance · render · reframe ·
                      addmusic · music · subsession · subtitles ·
-                     migrate_edits · common
+                     migrate_edits · archive · common
 .claude/skills/      the screen-studio skill for Claude Code automation
 .venv/               python env (faster-whisper, numpy, pillow) — made at setup
 music/               CC-BY track library + catalog — fetched by music.py

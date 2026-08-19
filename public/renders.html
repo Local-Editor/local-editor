@@ -12,6 +12,20 @@
 </header>
 
 <main>
+  <div class="archive-panel">
+    <div class="controls-row session-tools">
+      <label>☁ Archive renders older than
+        <input type="number" id="rDays" min="0" step="1" value="7" class="num-sm"> day(s)</label>
+      <button id="rArchiveBtn" class="btn btn-secondary"
+        title="Upload every finished render past that age to Google Drive and free the space here. Raw recordings are left alone.">☁ Archive old renders</button>
+      <span id="rStatus" class="hint">Counting…</span>
+    </div>
+    <div id="rBar" class="progress-track compress-all-bar hidden"><div id="rFill"></div></div>
+    <p class="hint archive-note">Only finished renders move — the raw footage they came from stays here.
+      Each one is verified on Drive before anything is deleted, and archived renders stay on this page
+      with a <b>⬇ Restore from Drive</b> button. Whole recordings are archived from the
+      <a href="editor.html">Edit</a> tab.</p>
+  </div>
   <div id="renderList" class="render-grid">Loading…</div>
 </main>
 
@@ -41,8 +55,97 @@ async function rename(session, patch) {
   load();
 }
 
+// ---------- Google Drive archive ----------
+// Always goes through archive.py --files, so archiving finished renders never
+// touches the raw recording they came from. `files` is one or more names in the
+// SAME session — the server runs one job per session, so they must go together.
+const ARCH_STAGES = { upload: 'uploading', verify: 'verifying',
+                      cleanup: 'freeing space', download: 'downloading' };
+
+async function runArchive(session, files, action, onProgress) {
+  const q = `session=${encodeURIComponent(session)}&files=${encodeURIComponent(files.join(','))}`;
+  const endpoint = action === 'archive' ? '/api/archive' : '/api/archive/restore';
+  const start = await (await fetch(`${endpoint}?${q}`, { method: 'POST' })).json()
+    .catch(() => ({ error: 'server did not respond' }));
+  // the server refuses a second job per session — don't then poll and report
+  // the unrelated render/compress job that is actually running
+  if (start.error) return { status: 'error', tail: start.error };
+  for (;;) {
+    await new Promise(res => setTimeout(res, 1500));
+    let j;
+    try { j = await (await fetch(`/api/job?session=${encodeURIComponent(session)}`)).json(); }
+    catch { continue; }
+    if (j.status !== 'running') return j;
+    const ap = [...(j.tail || '').matchAll(/»ap (\d+)/g)].pop();
+    if (onProgress) onProgress(ap ? +ap[1] : 0, ARCH_STAGES[j.stage] || 'working');
+  }
+}
+
+function failureOf(j) {
+  const line = ((j && j.tail) || '').split('\n').reverse()
+    .find(l => /error|fail|cannot|not configured|exited/i.test(l));
+  return line ? line.trim().slice(0, 200) : 'check the terminal running the server';
+}
+
+const $r = id => document.getElementById(id);
+let bulkBusy = false, bulkSummary = '';
+
+async function loadArchivePanel() {
+  let d;
+  try { d = await (await fetch(`/api/archive/renders?days=${encodeURIComponent($r('rDays').value)}`)).json(); }
+  catch { return; }
+  $r('rArchiveBtn').disabled = !d.files || bulkBusy;
+  if (bulkBusy) return;
+  $r('rStatus').textContent = bulkSummary || (d.files
+    ? `${d.files} render${d.files > 1 ? 's' : ''} older than ${d.days} day${d.days === 1 ? '' : 's'} (${fmtSize(d.bytes)})`
+    : `no renders older than ${d.days} day${d.days === 1 ? '' : 's'}`);
+}
+
+// Archive every eligible render, one recording at a time so each upload
+// commits to Drive before the next starts. Overall % is byte-weighted.
+async function archiveOldRenders() {
+  const d = await (await fetch(`/api/archive/renders?days=${encodeURIComponent($r('rDays').value)}`)).json();
+  if (!d.files) { $r('rStatus').textContent = 'nothing old enough to archive'; return; }
+  const btn = $r('rArchiveBtn');
+  if (!btn.dataset.armed) {              // two-step confirm, like the ⋮ actions
+    btn.dataset.armed = '1';
+    btn.textContent = `Upload ${d.files} render${d.files > 1 ? 's' : ''} (${fmtSize(d.bytes)}) and free the space? Click again`;
+    setTimeout(() => { btn.dataset.armed = ''; btn.textContent = '☁ Archive old renders'; }, 5000);
+    return;
+  }
+  btn.dataset.armed = '';
+  btn.textContent = '☁ Archive old renders';
+  bulkBusy = true; bulkSummary = '';
+  btn.disabled = true;
+  $r('rBar').classList.remove('hidden');
+
+  let doneBytes = 0, ok = 0, failed = 0;
+  for (let i = 0; i < d.groups.length; i++) {
+    const g = d.groups[i];
+    const show = (pct, stage) => {
+      const overall = d.bytes ? Math.min(99, Math.round((doneBytes + g.bytes * pct / 100) / d.bytes * 100)) : 0;
+      $r('rFill').style.width = overall + '%';
+      $r('rStatus').textContent =
+        `${overall}% · ${i + 1}/${d.groups.length}: ${g.title} (${g.files.length} file${g.files.length > 1 ? 's' : ''}) — ${stage} ${pct}%`;
+    };
+    show(0, 'starting');
+    const j = await runArchive(g.session, g.files, 'archive', show);
+    if (j.status === 'done') ok += g.files.length;
+    else { failed += g.files.length; console.warn(`archive ${g.session}:`, failureOf(j)); }
+    doneBytes += g.bytes;
+  }
+
+  $r('rFill').style.width = '100%';
+  bulkBusy = false;
+  bulkSummary = `✓ archived ${ok} render${ok === 1 ? '' : 's'}`
+    + (ok ? ` (${fmtSize(d.bytes)} freed)` : '')
+    + (failed ? ` · ${failed} failed — those files were left on disk` : '');
+  await load();
+}
+
 async function load() {
   const renders = await (await fetch('/api/renders')).json();
+  loadArchivePanel();
   const el = document.getElementById('renderList');
   if (!renders.length) {
     el.innerHTML = '<p class="hint">No renders yet — make a recording, edit it, and hit “Render clean video”.</p>';
@@ -54,26 +157,38 @@ async function load() {
     const shown = r.label || `${r.title} — ${k.label}`;
     const ext = (r.file.match(/\.\w+$/) || ['.mp4'])[0];
     const dlName = slug(r.label || `${r.title}-${r.kind}`) + ext;
+    // archived: the file is on Drive, not on disk — no video to play, and
+    // downloading it means fetching it back first
+    const preview = r.archived
+      ? `<div class="render-offline"><span>☁</span><b>On Google Drive</b>
+           <span class="hint">${r.mtime ? 'archived ' + fmtDate(r.mtime) : 'archived'} · ${fmtSize(r.size)} freed here</span></div>`
+      : `<video src="${url}" controls preload="metadata"></video>`;
+    const actions = r.archived
+      ? `<button class="btn r-restore" data-i="${i}">⬇ Restore from Drive</button>
+         <a class="btn btn-secondary" href="editor.html?session=${encodeURIComponent(r.session)}">Open in editor</a>`
+      : `<a class="btn" href="${url}" download="${esc(dlName)}">⬇ Download ${esc(dlName)}</a>
+         <a class="btn btn-secondary" href="editor.html?session=${encodeURIComponent(r.session)}">Open in editor</a>`;
     return `
-    <div class="render-card" data-i="${i}">
-      <video src="${url}" controls preload="metadata"></video>
+    <div class="render-card${r.archived ? ' offline' : ''}" data-i="${i}">
+      ${preview}
       <div class="render-meta">
         <div class="card-menu">
           <button class="menu-btn" data-i="${i}" title="Options">⋮</button>
           <div class="menu hidden">
             <button class="mi mi-rename" data-i="${i}">Rename render</button>
+            ${r.archived
+              ? `<button class="mi mi-restore" data-i="${i}">Restore from Drive</button>`
+              : `<button class="mi mi-archive" data-i="${i}">Archive to Google Drive</button>`}
             <button class="mi mi-delete" data-i="${i}">Delete render</button>
           </div>
         </div>
         <span class="kind-badge ${k.cls}" title="${k.hint}">${k.label}</span>
+        ${r.archived ? '<span class="kind-badge badge-cloud" title="Uploaded to Google Drive and removed from this Mac">☁ on Drive</span>' : ''}
         <b class="rename-render" data-i="${i}" title="Double-click to rename this render">${esc(shown)}</b>
         <span class="hint">recording: <span class="rename-session" data-i="${i}" title="Double-click to rename the recording">${esc(r.title)}</span>
-          · ${esc(r.file)} · ${fmtSize(r.size)} · ${fmtDate(r.mtime)}</span>
+          · ${esc(r.file)} · ${fmtSize(r.size)}${r.mtime ? ' · ' + fmtDate(r.mtime) : ''}</span>
         ${r.credits ? `<details><summary class="hint">music credit (paste into your description)</summary><pre class="credits">${esc(r.credits.trim())}</pre></details>` : ''}
-        <div class="controls-row">
-          <a class="btn" href="${url}" download="${esc(dlName)}">⬇ Download ${esc(dlName)}</a>
-          <a class="btn btn-secondary" href="editor.html?session=${encodeURIComponent(r.session)}">Open in editor</a>
-        </div>
+        <div class="controls-row">${actions}</div>
       </div>
     </div>`;
   }).join('');
@@ -102,7 +217,9 @@ async function load() {
     // two-step inline confirm — no native dialog
     if (!n.dataset.armed) {
       n.dataset.armed = '1';
-      n.textContent = r.kind === 'composite'
+      n.textContent = r.archived
+        ? 'Deletes the Google Drive copy too — click again'
+        : r.kind === 'composite'
         ? 'Editor rebuilds this on the next render (slow) — delete anyway?'
         : 'Really delete? Click again';
       n.classList.add('danger');
@@ -111,6 +228,32 @@ async function load() {
     }
     await fetch(`/api/render?session=${encodeURIComponent(r.session)}&file=${encodeURIComponent(r.file)}`,
       { method: 'DELETE' });
+    load();
+  });
+
+  el.querySelectorAll('.mi-archive').forEach(n => n.onclick = async e => {
+    e.stopPropagation();
+    const r = renders[+n.dataset.i];
+    if (!n.dataset.armed) {          // two-step inline confirm, like delete
+      n.dataset.armed = '1';
+      n.textContent = 'Upload to Drive and free the space? Click again';
+      setTimeout(() => { n.dataset.armed = ''; n.textContent = 'Archive to Google Drive'; }, 4000);
+      return;
+    }
+    n.disabled = true;
+    const j = await runArchive(r.session, [r.file], 'archive',
+      (pct, stage) => { n.textContent = `${stage} ${pct}%…`; });
+    if (j.status !== 'done') { n.disabled = false; n.textContent = `⚠ ${failureOf(j)}`; return; }
+    load();
+  });
+
+  el.querySelectorAll('.mi-restore, .r-restore').forEach(n => n.onclick = async e => {
+    e.stopPropagation();
+    const r = renders[+n.dataset.i];
+    n.disabled = true;
+    const j = await runArchive(r.session, [r.file], 'restore',
+      (pct, stage) => { n.textContent = `${stage} ${pct}%…`; });
+    if (j.status !== 'done') { n.disabled = false; n.textContent = `⚠ ${failureOf(j)}`; return; }
     load();
   });
 
@@ -125,7 +268,19 @@ async function load() {
     if (name && name.trim()) rename(r.session, { title: name.trim() });
   });
 }
-load();
+$r('rArchiveBtn').onclick = archiveOldRenders;
+$r('rDays').onchange = () => {
+  bulkSummary = '';
+  fetch('/api/archive/config', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rendersOlderThanDays: parseFloat($r('rDays').value) }),
+  }).then(loadArchivePanel);
+};
+// pick up the saved cutoff before the first count
+fetch('/api/archive/status').then(r => r.json()).then(s => {
+  $r('rDays').value = s.config.rendersOlderThanDays;
+  load();
+}).catch(load);
 </script>
 </body>
 </html>

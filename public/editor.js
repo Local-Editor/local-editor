@@ -30,31 +30,209 @@ function sessionMedia(s) {
   return { media, pending: media.filter(n => !done[n]) };
 }
 
+const fmtGB = b => b >= 1e9 ? (b / 1e9).toFixed(2) + ' GB'
+  : b >= 1e8 ? Math.round(b / 1e6) + ' MB' : (b / 1e6).toFixed(1) + ' MB';
+
 async function loadSessions() {
   const sessions = await (await fetch('/api/sessions')).json();
   if (!sessions.length) { $('sessionList').textContent = 'No recordings yet — make one on the Record tab.'; return; }
-  const anyPending = sessions.some(s => sessionMedia(s).pending.length);
+  const anyPending = sessions.some(s => !s.archive && sessionMedia(s).pending.length);
   $('sessionList').innerHTML = `
     <div class="controls-row session-tools">
       <button id="compressAllBtn" class="btn btn-secondary"${anyPending ? '' : ' disabled'}
         title="Re-encode every recording's source + composite files to reclaim disk space. Each file keeps its exact length; only replaced when it actually gets smaller.">🗜 Compress all recordings</button>
       <span id="compressAllStatus" class="hint"></span>
     </div>
-    <div id="compressAllBar" class="progress-track compress-all-bar hidden"><div id="compressAllFill"></div></div>` +
+    <div id="compressAllBar" class="progress-track compress-all-bar hidden"><div id="compressAllFill"></div></div>
+    <div class="archive-panel">
+      <div class="controls-row session-tools">
+        <label class="toggle" title="Every 30 minutes, any recording whose video files have sat untouched for longer than the cutoff is uploaded to Google Drive, verified, and removed from this Mac. Your transcript and edit stay here, so the recording keeps working — hit Restore to pull the video back.">
+          <input type="checkbox" id="archAuto"> ☁ Auto-archive old recordings to Google Drive
+        </label>
+        <label>idle for <input type="number" id="archDays" min="0" step="0.5" value="1" class="num-sm"> day(s)</label>
+        <button id="archNowBtn" class="btn btn-secondary"
+          title="Upload every eligible recording to Drive now, without waiting for the timer.">☁ Archive old recordings now</button>
+        <span id="archStatus" class="hint"></span>
+      </div>
+      <div id="archBar" class="progress-track compress-all-bar hidden"><div id="archFill"></div></div>
+      <p class="hint archive-note">Uploads go to <code id="archRemote">gdrive:</code> using your existing rclone setup —
+        files are verified on Drive <em>before</em> anything is deleted locally, and
+        <a href="http://127.0.0.1:5573/" target="_blank" rel="noopener">the rclone dashboard</a>
+        shows live transfers if you have it running.</p>
+    </div>` +
     sessions.map(s => {
       const { media, pending } = sessionMedia(s);
-      const ctl = pending.length
-        ? `<button class="btn btn-secondary sess-compress-btn" data-id="${esc(s.id)}">🗜 Compress (${pending.length})</button>`
-        : media.length ? '<span class="tag tag-ok">compressed ✔</span>' : '';
-      return `<p class="session-row" data-id="${esc(s.id)}">
+      // a session can be partly archived — one render pushed to Drive from the
+      // Renders page while the raw footage is still here
+      const a = s.archive;
+      const cloudTag = a
+        ? `<span class="tag tag-cloud" title="${a.count} file(s) on Drive${a.at ? ', archived ' + esc(a.at.slice(0, 10)) : ''} · ${fmtGB(a.bytes || 0)} freed">
+             ☁ ${a.whole ? 'on Drive' : `${a.count} on Drive`}</span>` : '';
+      const restoreBtn = a
+        ? `<button class="btn btn-secondary sess-restore-btn" data-id="${esc(s.id)}"
+             title="Download everything this recording has on Google Drive back to this Mac.">⬇ Restore</button>` : '';
+      const localCtl = a && a.whole ? ''
+        : `${pending.length
+            ? `<button class="btn btn-secondary sess-compress-btn" data-id="${esc(s.id)}">🗜 Compress (${pending.length})</button>`
+            : media.length ? '<span class="tag tag-ok">compressed ✔</span>' : ''}
+           ${media.length ? `<button class="btn btn-secondary sess-archive-btn" data-id="${esc(s.id)}"
+             title="Upload this recording's video to Google Drive and free the space here. The edit stays — restore it any time.">☁ Archive</button>` : ''}`;
+      return `<p class="session-row${a && a.whole ? ' archived' : ''}" data-id="${esc(s.id)}">
         <a href="editor.html?session=${encodeURIComponent(s.id)}">${esc(s.title)}</a>
         <span class="hint">${s.hasComposite ? '· composite ✔' : ''}
         ${s.hasTranscript ? '· transcript ✔' : '· <em>no transcript yet</em>'}
         ${s.hasClean ? '· clean.mp4 ✔' : ''}</span>
-        ${ctl}
+        <span class="sess-ctl">${cloudTag}${localCtl}${restoreBtn}</span>
       </p>`;
     }).join('');
   $('compressAllBtn').onclick = compressAllSessions;
+  wireArchiveTools();
+}
+
+// ---------- Google Drive archive ----------
+// Archiving MOVES a recording's video to Drive (upload → verify → delete local)
+// and leaves the transcript behind, so the session stays in this list and one
+// click brings the footage back.
+let archiveBusy = false;
+// survives the loadSessions() re-render that follows a sweep, so the result
+// line isn't clobbered by the status refresh racing behind it
+let archiveSummary = '';
+
+async function loadArchiveStatus() {
+  let st;
+  try { st = await (await fetch('/api/archive/status')).json(); } catch { return null; }
+  if (!$('archAuto')) return st;
+  $('archAuto').checked = !!st.config.enabled;
+  $('archDays').value = st.config.olderThanDays;
+  $('archRemote').textContent = st.config.remote;
+  const n = st.candidates.length;
+  $('archNowBtn').disabled = !n || archiveBusy;
+  if (!archiveBusy) {
+    $('archStatus').textContent = archiveSummary || [
+      n ? `${n} recording${n > 1 ? 's' : ''} ready to archive (${fmtGB(st.pendingBytes)})` : 'nothing old enough to archive',
+      st.archivedFiles ? `${st.archivedFiles} file${st.archivedFiles > 1 ? 's' : ''} on Drive (${fmtGB(st.archivedBytes)} freed)` : '',
+      st.sweeping ? 'auto-archive running…' : '',
+    ].filter(Boolean).join(' · ');
+  }
+  return st;
+}
+
+function saveArchiveConfig(patch) {
+  return fetch('/api/archive/config', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+}
+
+function wireArchiveTools() {
+  $('archAuto').onchange = async e => {
+    await saveArchiveConfig({ enabled: e.target.checked });
+    $('archStatus').textContent = e.target.checked
+      ? 'auto-archive on — sweeps every 30 minutes'
+      : 'auto-archive off';
+    setTimeout(loadArchiveStatus, 1500);
+  };
+  $('archDays').onchange = async e => {
+    await saveArchiveConfig({ olderThanDays: parseFloat(e.target.value) });
+    loadArchiveStatus();
+  };
+  $('archNowBtn').onclick = archiveOldNow;
+  loadArchiveStatus();
+}
+
+const ARCH_STAGES = {
+  upload: 'uploading to Drive', verify: 'verifying on Drive',
+  cleanup: 'freeing local space', download: 'downloading from Drive', done: 'done',
+};
+
+// Run archive/restore for one session, resolving with the finished job.
+// archive.py streams "»ap <pct>" (overall rclone %) and "»stage <name>".
+async function runArchiveJob(id, action, onProgress) {
+  const endpoint = action === 'archive' ? '/api/archive' : '/api/archive/restore';
+  const start = await (await fetch(`${endpoint}?session=${encodeURIComponent(id)}`,
+    { method: 'POST' })).json().catch(() => ({ error: 'server did not respond' }));
+  // the server refuses a second job per session — don't then poll and report
+  // the unrelated render/compress job that is actually running
+  if (start.error) return { status: 'error', tail: start.error };
+  for (;;) {
+    await new Promise(r => setTimeout(r, 1500));
+    let j;
+    try { j = await (await fetch(`/api/job?session=${encodeURIComponent(id)}`)).json(); }
+    catch { continue; }
+    if (j.status !== 'running') return j;
+    const tail = j.tail || '';
+    const ap = [...tail.matchAll(/»ap (\d+)/g)].pop();
+    if (onProgress) onProgress(ap ? +ap[1] : 0, ARCH_STAGES[j.stage] || 'working');
+  }
+}
+
+function archiveFailure(j) {
+  // surface the actual rclone error rather than a bare "failed"
+  const tail = (j && j.tail) || '';
+  const line = tail.split('\n').reverse().find(l => /error|fail|cannot|not configured|exited/i.test(l));
+  return line ? line.trim().slice(0, 200) : 'see the terminal running the server for details';
+}
+
+// per-recording ☁ Archive / ⬇ Restore (event-delegated — the list re-renders often)
+$('sessionList').addEventListener('click', async e => {
+  const btn = e.target.closest('.sess-archive-btn, .sess-restore-btn');
+  if (!btn) return;
+  e.preventDefault();
+  const archiving = btn.classList.contains('sess-archive-btn');
+  if (archiving && !confirm(
+    'Upload this recording\'s video to Google Drive and delete the local copy?\n\n'
+    + 'The transcript and your edit stay on this Mac, and “⬇ Restore” brings the video back whenever you want to edit it again.')) return;
+  btn.disabled = true;
+  const original = btn.textContent;
+  const j = await runArchiveJob(btn.dataset.id, archiving ? 'archive' : 'restore',
+    (pct, stage) => { btn.textContent = `${stage} ${pct}%…`; });
+  if (j.status === 'done') {
+    btn.textContent = archiving ? '✓ archived' : '✓ restored';
+  } else {
+    btn.textContent = original;
+    btn.disabled = false;
+    alert(`${archiving ? 'Archive' : 'Restore'} failed — nothing was deleted.\n\n${archiveFailure(j)}`);
+  }
+  await loadSessions();
+});
+
+// "Archive old recordings now" — every eligible session, one at a time so each
+// upload commits to Drive before the next starts.
+async function archiveOldNow() {
+  const { candidates } = await (await fetch('/api/archive/sweep')).json();
+  if (!candidates.length) { $('archStatus').textContent = 'nothing old enough to archive'; return; }
+  const totalBytes = candidates.reduce((s, c) => s + c.bytes, 0);
+  if (!confirm(
+    `Upload ${candidates.length} recording${candidates.length > 1 ? 's' : ''} (${fmtGB(totalBytes)}) to Google Drive `
+    + 'and delete the local video?\n\nEach one is verified on Drive before anything is deleted, and every '
+    + 'transcript stays here so you can restore the video later.')) return;
+
+  archiveBusy = true;
+  archiveSummary = '';
+  $('archNowBtn').disabled = true;
+  $('archBar').classList.remove('hidden');
+  const fill = $('archFill'), status = $('archStatus');
+  let doneBytes = 0, ok = 0, failed = 0;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    const show = (pct, stage) => {
+      const overall = totalBytes ? Math.min(99, Math.round((doneBytes + c.bytes * pct / 100) / totalBytes * 100)) : 0;
+      fill.style.width = overall + '%';
+      status.textContent = `${overall}% · ${i + 1}/${candidates.length}: ${c.id} — ${stage} ${pct}%`;
+    };
+    show(0, 'starting');
+    const j = await runArchiveJob(c.id, 'archive', show);
+    if (j.status === 'done') ok++; else { failed++; console.warn(`archive ${c.id}:`, archiveFailure(j)); }
+    doneBytes += c.bytes;
+  }
+
+  fill.style.width = '100%';
+  archiveBusy = false;
+  archiveSummary = `✓ archived ${ok} recording${ok === 1 ? '' : 's'}`
+    + (ok ? ` (${fmtGB(totalBytes)} freed)` : '')
+    + (failed ? ` · ${failed} failed — those files were left on disk` : '');
+  await loadSessions();
 }
 
 // compress ONE session's files, resolving when the job finishes; onProgress("k/N")
@@ -162,6 +340,10 @@ async function openSession() {
   sessFiles = sess.files || [];
   sessName = sess.title || sessionId;
   applySessName();
+  // All media archived to Drive: the transcript below is fully editable, but
+  // there is nothing to play or render until the video comes back down. A
+  // partly-archived session (a lone render on Drive) still plays fine.
+  if (sess.archive && sess.archive.whole) showArchivedBar(sess.archive);
   // Prefer the raw pair (instant, no waiting on ffmpeg): screen video with
   // the webcam played on top of it in the recorded layout. The composite is
   // only used when the raw screen file is gone. A 1080p H.264 preview proxy,
@@ -214,6 +396,32 @@ async function openSession() {
   if (job.status === 'running') {
     pollJob(job.name).then(j => { if (j.status === 'done') refreshDownloadLinks(); });
   }
+}
+
+// Offline-media banner for an archived session, with the one click that undoes it.
+function showArchivedBar(arch) {
+  const bar = $('archiveBar');
+  const when = (arch.at || '').slice(0, 10);
+  bar.classList.remove('hidden');
+  bar.innerHTML = `<span class="bar-text">☁ <b>Video is on Google Drive</b> — archived ${esc(when)},
+    ${fmtGB(arch.bytes || 0)} freed here. Your transcript and edit are intact; restore the video to
+    play or render it.</span>
+    <button id="archRestoreBtn" class="btn btn-secondary">⬇ Restore from Drive</button>`;
+  // rendering an archived session would just fail on missing input
+  for (const id of ['renderBtn', 'aiCleanBtn']) {
+    const b = $(id);
+    if (b) { b.disabled = true; b.title = 'Restore the video from Google Drive first'; }
+  }
+  $('archRestoreBtn').onclick = async () => {
+    const btn = $('archRestoreBtn');
+    btn.disabled = true;
+    const j = await runArchiveJob(sessionId, 'restore',
+      (pct, stage) => { btn.textContent = `${stage} ${pct}%…`; });
+    if (j.status === 'done') { location.reload(); return; }
+    btn.disabled = false;
+    btn.textContent = '⬇ Restore from Drive';
+    alert(`Restore failed.\n\n${archiveFailure(j)}`);
+  };
 }
 
 async function refreshDownloadLinks() {
@@ -1250,6 +1458,7 @@ const JOB_LABELS = {
   render: 'Rendering clean video', transcribe: 'Transcribing', composite: 'Compositing',
   addmusic: 'Adding music', enhance: 'AI clean-up', subsession: 'Creating edit session',
   'compress-files': 'Compressing edit files', proxy: 'Building smooth preview',
+  archive: 'Archiving to Google Drive', restore: 'Restoring from Google Drive',
 };
 
 // expected output length in seconds, used to turn ffmpeg/whisper logs into a %
@@ -1263,6 +1472,11 @@ function jobTarget(name) {
 }
 
 function jobPercent(name, tail) {
+  // rclone transfers stream "»ap <pct>" — already an overall percentage
+  if (name === 'archive' || name === 'restore') {
+    const ap = [...tail.matchAll(/»ap (\d+)/g)].pop();
+    return ap ? Math.max(1, Math.min(99, +ap[1])) : null;
+  }
   // multi-file jobs stream "»fp k/N pct" (within-file %) — progress by file
   if (name === 'compress-files' || name === 'proxy') {
     const fp = [...tail.matchAll(/»fp (\d+)\/(\d+) (\d+)/g)].pop();

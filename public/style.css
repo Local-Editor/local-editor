@@ -342,14 +342,30 @@ body.wide .transcript { max-height: calc(100vh - 360px); }
   padding: 8px 2px; margin: 0; border-bottom: 1px solid var(--hairline-2);
 }
 .session-row > a { font-weight: 600; }
-.session-row .sess-compress-btn { margin-left: auto; padding: 4px 12px; font-size: 12.5px; }
-.session-row .tag { margin-left: auto; }
+.session-row .sess-ctl {
+  margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.session-row .sess-ctl .btn { padding: 4px 12px; font-size: 12.5px; }
+.session-row.archived > a { color: var(--text-2); }
 .compress-all-bar { margin: 0 0 14px; }
-#compressAllFill {
+#compressAllFill, #archFill {
   height: 100%; width: 0; border-radius: 980px;
   background: linear-gradient(90deg, var(--accent), #64d2ff);
   transition: width 0.4s var(--ease);
 }
+
+/* ---------- Google Drive archive ---------- */
+.archive-panel {
+  margin: 4px 0 18px; padding: 12px 14px 4px;
+  background: var(--surface); border: 1px solid var(--hairline);
+  border-radius: var(--r-m);
+}
+.archive-panel .session-tools { margin: 0 0 10px; }
+.archive-note { margin: 2px 0 10px; color: var(--text-3); }
+.archive-note code { color: var(--text-2); }
+.archive-note a { color: var(--accent); }
+input.num-sm { width: 62px; }
+.tag-cloud { background: rgba(10, 132, 255, 0.16); color: #64d2ff; }
 
 /* ---------- progress ---------- */
 .job-progress { margin: 12px 0; }
@@ -399,6 +415,7 @@ body.wide .transcript { max-height: calc(100vh - 360px); }
 .proxy-bar.warn { background: rgba(255, 159, 10, 0.12); color: var(--text); border: 1px solid rgba(255, 159, 10, 0.28); }
 .proxy-bar.ok { background: rgba(48, 209, 88, 0.12); color: var(--text-2); border: 1px solid rgba(48, 209, 88, 0.22); }
 .proxy-bar .btn { margin-left: auto; padding: 4px 12px; }
+.proxy-bar .bar-text { flex: 1; min-width: 240px; }
 
 /* ---------- timeline dock ---------- */
 .timeline-bar {
@@ -489,6 +506,19 @@ body.wide .transcript { max-height: calc(100vh - 360px); }
 .kind-clean { background: rgba(48, 209, 88, 0.14); color: var(--green); }
 .kind-music { background: rgba(191, 90, 242, 0.14); color: var(--purple); }
 .kind-composite { background: rgba(255, 255, 255, 0.08); color: var(--text-2); }
+.badge-cloud { background: rgba(10, 132, 255, 0.16); color: #64d2ff; }
+
+/* a render that lives on Drive: same card, no video to play */
+.render-card.offline { border-style: dashed; }
+.render-offline {
+  width: 100%; aspect-ratio: 16/9;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+  background: linear-gradient(160deg, rgba(10, 132, 255, 0.07), rgba(255, 255, 255, 0.02));
+  border-bottom: 1px solid var(--hairline);
+  text-align: center; padding: 0 20px;
+}
+.render-offline > span:first-child { font-size: 30px; line-height: 1.1; opacity: 0.85; }
+.render-offline b { font-size: 14px; font-weight: 600; color: var(--text-2); }
 
 .card-menu { position: absolute; top: 10px; right: 12px; }
 .menu-btn {

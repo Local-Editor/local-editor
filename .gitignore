@@ -11,3 +11,6 @@ music/
 node_modules/
 .DS_Store
 *.log
+
+# Google Drive archive settings (machine-local: remote name, cutoff, on/off)
+archive-config.json
