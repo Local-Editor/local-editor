@@ -92,6 +92,18 @@ Left = video preview + controls. Right = the **transcript**. Bottom = the
 - Format: Original 16:9, or **9:16 / 1:1 Shorts** (webcam-top, screen-top,
   bubble-overlay). Live preview updates when you pick a format.
 - Quality: High / Balanced / Small. Uses the Mac's hardware encoder (fast).
+- 💬 **Subtitles in one click**: "Add subtitles" reads the transcript and drops
+  a caption clip onto a Subtitles timeline for every phrase you kept. Drag,
+  trim, duplicate or right-click one to retype it, like any clip. Three looks
+  (outline / boxed / bold yellow caps), three sizes, top / middle / bottom —
+  previewed live over the player and **burned into the render**. Cut something
+  afterwards and the button turns orange to offer a rebuild.
+  - **Words at once** sets how much text is on screen: 1–6 for the fast
+    one-or-two-word look, or "Full phrase" to break on pauses and sentence
+    ends. Changing it re-chunks the captions straight away.
+  - **Highlight spoken word** lights the word being said and fades the rest.
+    The timing comes from the transcript's per-word timestamps, so the
+    highlight stays on the right word through cuts and rearranged footage.
 - 🎵 Background music is a **timeline track**: pick a track (▶ 30s to preview),
   hit "Add to timeline" and it lands as a clip on a Music lane at the playhead —
   drag/trim it like any clip. At render it's mixed **ducked under your voice**.
@@ -124,9 +136,10 @@ maximum accuracy (catches more umms + missed words).
 server.js            zero-dependency Node server (UI, uploads, ffmpeg jobs)
 public/              record + edit + renders UI (no build step)
 scripts/             composite · transcribe · enhance · render · reframe ·
-                     addmusic · music · subsession · migrate_edits · common
+                     addmusic · music · subsession · subtitles ·
+                     migrate_edits · common
 .claude/skills/      the screen-studio skill for Claude Code automation
-.venv/               python env (faster-whisper, numpy) — created at setup
+.venv/               python env (faster-whisper, numpy, pillow) — made at setup
 music/               CC-BY track library + catalog — fetched by music.py
 recordings/          one folder per session (edit state lives in transcript.json)
 ```

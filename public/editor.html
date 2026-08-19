@@ -29,6 +29,7 @@
           <video id="insertPlayer" class="insert-player hidden" playsinline></video>
           <div id="gapCover" class="gap-cover hidden"></div>
           <div id="insertBadge" class="insert-badge hidden">▶ insert</div>
+          <div id="capOverlay" class="cap-overlay hidden"><span id="capText"></span></div>
         </div>
         <div id="proxyBar" class="proxy-bar hidden"></div>
         <div class="stat-bar">
@@ -68,6 +69,47 @@
             <input type="checkbox" id="renderDenoise"> Remove background noise
           </label>
           <button id="renderBtn" class="btn">Render clean video</button>
+        </div>
+        <div class="controls-row">
+          <button id="subsBtn" class="btn btn-secondary"
+                  title="Reads the transcript and drops a caption clip onto a Subtitles timeline for every phrase you kept. Drag, trim and retype them like any clip — they burn into the render.">💬 Add subtitles</button>
+          <span id="subsCount" class="hint"></span>
+          <label>Look
+            <select id="subsStyle">
+              <option value="outline" selected>Outline — white, dark edge</option>
+              <option value="boxed">Boxed — white on black</option>
+              <option value="pop">Pop — bold yellow caps</option>
+            </select>
+          </label>
+          <label>Size
+            <select id="subsSize">
+              <option value="small">Small</option>
+              <option value="medium" selected>Medium</option>
+              <option value="large">Large</option>
+            </select>
+          </label>
+          <label>Position
+            <select id="subsPos">
+              <option value="bottom" selected>Bottom</option>
+              <option value="middle">Middle</option>
+              <option value="top">Top</option>
+            </select>
+          </label>
+          <label title="How much text is on screen at a time. A low number gives the fast one-or-two-word look; “Full phrase” breaks on pauses and sentence ends instead.">Words at once
+            <select id="subsWords">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+              <option value="6">6</option>
+              <option value="auto" selected>Full phrase</option>
+            </select>
+          </label>
+          <label class="toggle" title="Lights the word being spoken and fades the rest of the caption — the timing comes from the transcript, so it stays on the word through cuts.">
+            <input type="checkbox" id="subsHighlight" checked> Highlight spoken word
+          </label>
+          <button id="subsClearBtn" class="btn btn-secondary hidden">✕ Remove subtitles</button>
         </div>
         <div class="controls-row">
           <label>🎵 Background music
@@ -154,6 +196,7 @@
     <button class="mi" id="ctxFileInsert">🎞 Insert video / audio file…</button>
     <button class="mi" id="ctxFromEdit">📼 Add from another edit…</button>
     <button class="mi hidden" id="ctxOpenInsert">▶ Open insert</button>
+    <button class="mi hidden" id="ctxEditCaption">✏ Edit caption text…</button>
     <button class="mi hidden" id="ctxDuplicateInsert">⧉ Duplicate clip</button>
     <button class="mi danger hidden" id="ctxRemoveInsert">✕ Remove insert</button>
     <button class="mi hidden" id="ctxMusicVol">🎚 Music volume…</button>

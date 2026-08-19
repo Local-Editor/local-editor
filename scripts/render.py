@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from common import (ffprobe, has_audio, duration_of, run_ffmpeg, load_json,
                     keep_segments, encode_args, video_stream, clean_time, even,
                     compress_to_hevc)
+import subtitles
 
 
 DENOISE_MODEL = Path(__file__).resolve().parent / "models" / "rnnoise.rnnn"
@@ -210,6 +211,88 @@ def normalize_overlay(d, ins, W, H, fps, quality, tmpdir, k):
     return norm, ox, oy
 
 
+def eff_dur(ins):
+    """Clip length after its own internal cuts — mirrors effDur() in editor.js."""
+    cut = 0.0
+    for c in ins.get("cuts") or []:
+        try:
+            cut += max(0.0, float(c[1]) - float(c[0]))
+        except (TypeError, ValueError, IndexError):
+            pass
+    return max(0.0, float(ins.get("duration") or 0) - cut)
+
+
+def arrangement_to_source(segments, c):
+    """Timeline position -> time on the source recording (None inside a gap)."""
+    for sg in segments:
+        length = float(sg["s1"]) - float(sg["s0"])
+        if float(sg["pos"]) <= c < float(sg["pos"]) + length:
+            return float(sg["s0"]) + (c - float(sg["pos"]))
+    return None
+
+
+def write_captions(cues, tr, W, H, tmpdir, to_output):
+    """Caption clips (timeline positions) -> a transparent caption track timed
+    to the OUTPUT video, or None when there is nothing to burn. `to_output`
+    maps a timeline position to a time in the finished file."""
+    if not cues:
+        return None
+    timed = []
+    prev_end = 0.0
+    for c in sorted(cues, key=lambda i: float(i.get("at") or 0)):
+        text = (c.get("text") or "").strip()
+        length = eff_dur(c)
+        if not text or length <= 0.05:
+            continue
+        at = float(c.get("at") or 0)
+        a, b = to_output(at), to_output(at + length)
+        # a caption whose material was cut away maps to zero length. The floor
+        # is deliberately low: at one word per caption a quick "the" genuinely
+        # is only a couple of frames long.
+        if a is None or b is None or b - a < 0.06:
+            continue
+        a = max(a, prev_end)                     # never let two overlap
+        if b - a < 0.06:
+            continue
+        prev_end = b
+        # per-word timings ride the same arrangement -> output mapping, so the
+        # highlight stays on the spoken word after cuts move it
+        words = []
+        for w in c.get("words") or []:
+            try:
+                ws, we = to_output(float(w["s"])), to_output(float(w["e"]))
+            except (TypeError, ValueError, KeyError):
+                words = []
+                break
+            if ws is None or we is None:
+                words = []
+                break
+            words.append((w.get("w"), max(a, ws), min(b, max(we, ws))))
+        timed.append((a, b, text, words or None))
+    try:
+        layer = subtitles.render_layer(timed, W, H, tmpdir,
+                                       tr.get("subtitleStyle"))
+    except subtitles.MissingPillow as e:
+        print(f"captions skipped — {e}", flush=True)
+        return None
+    if layer:
+        print(f"burning in {len(timed)} caption(s)", flush=True)
+    return layer
+
+
+def caption_input(cap):
+    """ffmpeg input args for the transparent caption track."""
+    return ["-f", "concat", "-safe", "0", "-i", str(cap[0])]
+
+
+def burn_captions(src, cap, fps, quality, out):
+    """Standalone caption pass — used when nothing else touches the picture."""
+    graph = subtitles.overlay_filter(1, fps, "[0:v]", "[v]", cap[1])
+    run_ffmpeg(["-i", str(src)] + caption_input(cap)
+               + ["-filter_complex", graph, "-map", "[v]", "-map", "0:a?"]
+               + encode_args(quality) + [str(out)])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("session_dir")
@@ -272,6 +355,17 @@ def main():
     W, H = even(int(vs["width"])), even(int(vs["height"]))
     keeps_all = [(max(0.0, a), min(b, dur)) for a, b in keep_segments(tr) if a < dur]
 
+    segments = sorted(tr.get("segments") or
+                      [{"id": "seg1", "s0": 0.0, "s1": dur, "pos": 0.0}],
+                      key=lambda s: s["pos"])
+    inserts_all = sorted(tr.get("inserts") or [], key=lambda i: i.get("at", 0))
+    # music clips are audio beds mixed (ducked) under the voice; captions are
+    # burned into the picture at the very end — neither is a video overlay
+    music_ins = [i for i in inserts_all if i.get("kind") == "music"]
+    caption_ins = [i for i in inserts_all if i.get("kind") == "subtitle"]
+    overlays = [i for i in inserts_all
+                if i.get("kind") not in ("music", "subtitle")]
+
     # ---- partial render: just the selected slice, no arrangement ----
     if args.range:
         r0, r1 = args.range
@@ -279,17 +373,19 @@ def main():
         if not keeps:
             sys.exit("nothing kept inside the selected range")
         n = cut_piece(src, keeps, fps, args.quality, audio, out)
+        rtmp = Path(tempfile.mkdtemp(prefix="caption-"))
+
+        def range_time(c):
+            t = arrangement_to_source(segments, c)
+            return None if t is None else clean_time(t, keeps)
+        cap = write_captions(caption_ins, tr, W, H, rtmp, range_time)
+        if cap:
+            burned = rtmp / "burned.mp4"
+            burn_captions(out, cap, fps, args.quality, burned)
+            burned.replace(out)
         _maybe_compress(out, args)
         print(f"clean video: {out} ({n:.1f}s of selection)", flush=True)
         return
-
-    segments = sorted(tr.get("segments") or
-                      [{"id": "seg1", "s0": 0.0, "s1": dur, "pos": 0.0}],
-                      key=lambda s: s["pos"])
-    inserts_all = sorted(tr.get("inserts") or [], key=lambda i: i.get("at", 0))
-    # music clips are audio beds mixed (ducked) under the voice, not overlays
-    music_ins = [i for i in inserts_all if i.get("kind") == "music"]
-    overlays = [i for i in inserts_all if i.get("kind") != "music"]
     # stack by track like the editor preview: the upper track (lower index) wins.
     # overlays are composited in list order and the LAST one lands on top, so
     # sort upper tracks LAST (track index descending), ties broken by position.
@@ -358,10 +454,21 @@ def main():
         run_ffmpeg(inputs + ["-filter_complex", graph, "-map", "[v]", "-map", "[a]"]
                    + encode_args(args.quality) + [str(arranged)])
 
-    if not overlays and not music_ins:
-        arranged.replace(out)
+    cap_file = write_captions(caption_ins, tr, W, H, tmpdir, final_time)
+
+    def finish_plain():
+        """Nothing left to composite or mix — captions (if any) are the only
+        thing still to draw on the arrangement."""
+        if cap_file:
+            print("»stage captions", flush=True)
+            burn_captions(arranged, cap_file, fps, args.quality, out)
+        else:
+            arranged.replace(out)
         _maybe_compress(out, args)
         print(f"clean video: {out} ({duration_of(out):.1f}s)", flush=True)
+
+    if not overlays and not music_ins:
+        finish_plain()
         return
 
     # ---- composite overlays ON TOP at their timeline positions ----
@@ -390,9 +497,7 @@ def main():
         print(f"mixing {len(mus)} music bed(s), ducked under the voice", flush=True)
 
     if not norm and not mus:
-        arranged.replace(out)
-        _maybe_compress(out, args)
-        print(f"clean video: {out} ({duration_of(out):.1f}s)", flush=True)
+        finish_plain()
         return
     print("»stage mix", flush=True)
 
@@ -402,8 +507,9 @@ def main():
 
     total_out = max(base_dur + ext, base_dur)
     # music-only pass leaves every pixel alone — copy the video stream
-    # instead of re-encoding (fast, no generation loss)
-    video_untouched = not norm and ext <= 0.01
+    # instead of re-encoding (fast, no generation loss). Captions are drawn
+    # into the picture, so they rule that shortcut out.
+    video_untouched = not norm and ext <= 0.01 and not cap_file
     inputs = ["-i", str(arranged)]
     parts = []
     vprev = "[bv]"
@@ -479,6 +585,13 @@ def main():
     elif mus:
         # every bed fell outside the video — drop the unused sidechain key
         parts.append("[sckey]anullsink")
+    # captions land last, on top of everything that was composited. The layer
+    # is the final input so the overlay/music indices above stay put.
+    if cap_file:
+        inputs += caption_input(cap_file)
+        parts.append(subtitles.overlay_filter(
+            1 + len(norm) + len(mus_pads), fps, vprev, "[vcap]", cap_file[1]))
+        vprev = "[vcap]"
     # dropout_transition=0: the default 2s end-of-stream ramp renormalizes the
     # whole mix ~3dB down when a delayed/trimmed input ends — kills the fix
     parts.append("".join(amix_pads) +

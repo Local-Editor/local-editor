@@ -1,3 +1,6 @@
 # Python deps for the transcription + editing scripts (installed into ./.venv)
 faster-whisper>=1.0
 numpy
+# draws the burned-in captions (scripts/subtitles.py) — ffmpeg is not used for
+# text, so builds without libass/libfreetype still render subtitles
+pillow

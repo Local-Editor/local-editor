@@ -202,6 +202,7 @@ async function openSession() {
   tr = await res.json();
   tr.settings = tr.settings || { padSec: 0.12, maxGapSec: 1.0 };
   migrateCamKeyframes();
+  applySubStyle();
   histReset();   // undo baseline = the transcript as loaded
   renderTranscript();
   updateStats();
@@ -621,6 +622,7 @@ function updateStats() {
   $('statClean').textContent = fmtSec(finalDuration());
   $('statRemoved').textContent = fmtSec(Math.max(0, dur - keep));
   refreshExports();
+  refreshSubsUi();
   tl.static = null; // cuts changed — timeline redraws next frame
 }
 
@@ -900,6 +902,344 @@ $('musicBtn').onclick = async () => {
   }
 };
 
+// ---------- subtitles ----------
+// A caption is an insert of kind "subtitle" on its own timeline, so it drags,
+// trims, splits and gets retyped like any other clip. scripts/subtitles.py
+// draws them at render time; nothing here touches the video.
+const SUB_TRACK = 'subs';
+const SUB_MAX_CHARS = 76;   // ≈2 lines — matches MAX_CHARS in scripts/subtitles.py
+const SUB_MAX_SEC = 5.0;    // never hold one caption longer than this
+const SUB_MIN_SEC = 0.9;    // ...nor flash one faster than this
+const SUB_MIN_SHOWN = 0.06; // below this a caption is gone before it's read —
+                            // matches the floor in render.py's write_captions
+const SUB_GAP_SEC = 0.55;   // a pause this long starts a new caption
+const SUB_SIZE_DIV = { small: 30, medium: 23, large: 17 };  // fontsize = height / N
+const SUB_EM = { outline: 0.52, boxed: 0.52, pop: 0.80 };   // avg glyph advance
+
+function subCues() {
+  return ((tr && tr.inserts) || []).filter(i => i.kind === 'subtitle');
+}
+function subStyle() {
+  return (tr && tr.subtitleStyle) || readSubStyle();
+}
+function readSubStyle() {
+  return { style: $('subsStyle').value, size: $('subsSize').value,
+           position: $('subsPos').value, words: $('subsWords').value,
+           highlight: $('subsHighlight').checked };
+}
+// "Words at once": a number caps each caption at that many words, 'auto' breaks
+// on pauses, sentence ends and length instead
+function subWordCap() {
+  const n = parseInt($('subsWords').value, 10);
+  return n > 0 ? n : 0;
+}
+function subLabel(text) {
+  return `💬 ${text.length > 26 ? text.slice(0, 25) + '…' : text}`;
+}
+
+// Group the kept words into readable captions. Each caption stays inside ONE
+// keep span of ONE footage piece, so it can never straddle a cut (which would
+// show text over material that was edited out from under it).
+function buildSubtitleCues() {
+  const keeps = keepSegments();
+  const stamp = Date.now().toString(36);
+  const cap = subWordCap();
+  const cues = [];
+  for (const sg of segs()) {
+    const segEnd = sg.pos + segLen(sg);
+    for (const [ka, kb] of keeps) {
+      const a = Math.max(ka, sg.s0), b = Math.min(kb, sg.s1);
+      if (b - a < 0.2) continue;
+      const words = tr.words.filter(w => {
+        const mid = (w.start + w.end) / 2;
+        return !w.removed && !w.detected && w.w && w.w.trim() && mid >= a && mid <= b;
+      });
+      let block = [];
+      // source time -> timeline position, within this piece
+      const posOf = t => sg.pos + (t - sg.s0);
+      const emit = () => {
+        if (!block.length) return;
+        const parts = block.map(w => w.w.trim().replace(/\s+/g, ' ')).filter(Boolean);
+        const text = parts.join(' ');
+        const s = Math.max(sg.pos, posOf(block[0].start) - 0.06);
+        const e = posOf(block[block.length - 1].end) + 0.14;
+        const dur = Math.min(Math.max(e - s, SUB_MIN_SEC), Math.max(0.3, segEnd - s));
+        // one entry per word, so the render can light the word being spoken.
+        // These MUST stay in step with `text` — a mismatch turns highlighting
+        // off for the caption rather than lighting the wrong word.
+        const wordTimes = block
+          .filter(w => w.w.trim())
+          .map(w => ({ w: w.w.trim().replace(/\s+/g, ' '),
+                       s: Math.round(Math.max(s, posOf(w.start)) * 100) / 100,
+                       e: Math.round(posOf(w.end) * 100) / 100 }));
+        block = [];
+        if (!text) return;
+        cues.push({
+          id: `sub-${stamp}-${cues.length}`, kind: 'subtitle', track: SUB_TRACK,
+          at: Math.round(s * 100) / 100, duration: Math.round(dur * 100) / 100,
+          text, words: wordTimes, label: subLabel(text),
+        });
+      };
+      for (const w of words) {
+        if (block.length) {
+          const prev = block[block.length - 1];
+          const joined = block.map(x => x.w).join(' ') + ' ' + w.w;
+          const sentenceEnd = /[.!?…]["'’)\]]?$/.test(prev.w);
+          const full = cap ? block.length >= cap
+            : (joined.length > SUB_MAX_CHARS || (sentenceEnd && block.length >= 3));
+          if (full || w.start - prev.end > SUB_GAP_SEC
+              || w.end - block[0].start > SUB_MAX_SEC) emit();
+        }
+        block.push(w);
+      }
+      emit();
+    }
+  }
+  cues.sort((a, b) => a.at - b.at);
+  // One caption must never still be up when the next one appears — captions
+  // tile. This matters most at a low word count, where SUB_MIN_SEC would
+  // otherwise stretch every one-word caption over its successors.
+  for (let i = 0; i < cues.length - 1; i++) {
+    const room = Math.round((cues[i + 1].at - cues[i].at - 0.02) * 100) / 100;
+    if (cues[i].duration > room) cues[i].duration = Math.max(0, room);
+  }
+  // Anything squeezed below ~2 frames is gone before it can be read. Fold it
+  // into the caption that follows instead of dropping it — at one word each,
+  // dropping would silently lose the fast words ("a", "I", contractions).
+  for (let i = cues.length - 2; i >= 0; i--) {
+    if (cues[i].duration >= SUB_MIN_SHOWN) continue;
+    mergeCueInto(cues[i], cues[i + 1]);
+    cues.splice(i, 1);
+  }
+  if (cues.length && cues[cues.length - 1].duration < SUB_MIN_SHOWN) cues.pop();
+  // the per-word timings drive the highlight, so keep them inside the caption
+  // they belong to after all that clamping
+  for (const cue of cues) {
+    const end = cue.at + cue.duration;
+    for (const w of cue.words || []) {
+      w.s = Math.round(Math.max(cue.at, Math.min(w.s, end)) * 100) / 100;
+      w.e = Math.round(Math.max(w.s, Math.min(w.e, end)) * 100) / 100;
+    }
+  }
+  // A word or two stranded against a cut (an "um" removed mid-sentence ends
+  // the keep span, and with it the caption) reads as a flash. Fold it into the
+  // caption that follows, which the cut has left back-to-back with it anyway.
+  // Skipped on a fixed word count — merging would put more words on screen
+  // than the setting asks for.
+  if (!cap) {
+    for (let i = cues.length - 2; i >= 0; i--) {
+      const a = cues[i], b = cues[i + 1];
+      const gap = b.at - (a.at + a.duration);
+      if (a.duration >= 0.5 || gap < -0.01 || gap > 0.12) continue;
+      if ((a.text + ' ' + b.text).length > SUB_MAX_CHARS) continue;
+      mergeCueInto(a, b);
+      cues.splice(i, 1);
+    }
+  }
+  return cues;
+}
+
+// fold caption `a` into the one after it, `b`, which then covers both spans
+function mergeCueInto(a, b) {
+  const end = b.at + b.duration;
+  b.at = a.at;
+  b.duration = Math.round((end - a.at) * 100) / 100;
+  b.text = `${a.text} ${b.text}`;
+  b.words = (a.words || []).concat(b.words || []);
+  b.label = subLabel(b.text);
+}
+
+// Spread a caption's text across its own span, weighted by word length. Used
+// after a caption is retyped by hand: the original per-word timings no longer
+// describe the new text, but an even guess keeps the highlight moving.
+function respaceCueWords(cue) {
+  const parts = (cue.text || '').split(/\s+/).filter(Boolean);
+  if (!parts.length) { cue.words = []; return; }
+  const total = parts.reduce((n, p) => n + p.length + 1, 0);
+  const span = Math.max(0.2, effDur(cue));
+  let t = cue.at;
+  cue.words = parts.map(p => {
+    const d = span * ((p.length + 1) / total);
+    const w = { w: p, s: Math.round(t * 100) / 100, e: Math.round((t + d) * 100) / 100 };
+    t += d;
+    return w;
+  });
+}
+
+// cheap fingerprint of everything the cues were generated from, so the button
+// can say "update" once you cut something after adding them
+function subSignature() {
+  const kept = tr.words.filter(w => !w.removed && !w.detected);
+  return keepSegments().map(([a, b]) => `${a.toFixed(2)}-${b.toFixed(2)}`).join('|')
+    + '#' + segs().map(s => `${s.pos.toFixed(2)}:${s.s0.toFixed(2)}-${s.s1.toFixed(2)}`).join('|')
+    + '#' + kept.length + ':' + kept.reduce((n, w) => n + w.w.length, 0)
+    + '#' + $('subsWords').value;
+}
+
+function refreshSubsUi() {
+  if (!tr) return;
+  const n = subCues().length;
+  const stale = n > 0 && tr.subtitleSig !== subSignature();
+  const btn = $('subsBtn');
+  btn.textContent = !n ? '💬 Add subtitles'
+    : stale ? '💬 Update subtitles •' : '💬 Rebuild subtitles';
+  btn.title = !n
+    ? 'Reads the transcript and drops a caption clip onto a Subtitles timeline for every phrase you kept. Drag, trim and retype them like any clip — they burn into the render.'
+    : stale
+      ? 'The edit changed since these captions were made — click to rebuild them from the current transcript (any text you retyped by hand is replaced).'
+      : 'Rebuild every caption from the current transcript (any text you retyped by hand is replaced).';
+  btn.classList.toggle('btn-attn', stale);
+  $('subsCount').textContent = n ? `${n} caption${n === 1 ? '' : 's'}` : '';
+  $('subsClearBtn').classList.toggle('hidden', !n);
+}
+
+async function applySubtitles(rechunked) {
+  const btn = $('subsBtn');
+  btn.disabled = true;
+  try {
+    const cues = buildSubtitleCues();
+    if (!cues.length) {
+      tlToast('nothing to caption yet — the transcript has no kept words');
+      return;
+    }
+    tlTracks();
+    if (!tr.tracks.some(t => t.id === SUB_TRACK)) {
+      tr.tracks.unshift({ id: SUB_TRACK, name: 'Subtitles' });  // drawn on top
+    }
+    tr.inserts = ((tr.inserts || []).filter(i => i.kind !== 'subtitle')).concat(cues);
+    tr.subtitleStyle = readSubStyle();
+    tr.subtitleSig = subSignature();
+    tl.selectedLane = -1; tl.expandedLane = null;
+    markDirty(); await saveTranscript(); updateStats();
+    tl.static = null; if (tl.resize) tl.resize();
+    const cap = subWordCap();
+    tlToast(rechunked
+      ? `💬 rebuilt as ${cues.length} captions of ${cap ? `${cap} word${cap === 1 ? '' : 's'}` : 'a full phrase'} each`
+      : `💬 ${cues.length} captions on the Subtitles timeline — drag, trim or right-click one to retype it; they burn into the render`);
+  } finally {
+    btn.disabled = false;
+  }
+}
+$('subsBtn').onclick = () => applySubtitles(false);
+
+$('subsClearBtn').onclick = async () => {
+  tr.inserts = (tr.inserts || []).filter(i => i.kind !== 'subtitle');
+  const left = (tr.tracks || []).filter(t => t.id !== SUB_TRACK);
+  if (left.length) tr.tracks = left;   // tlTracks() needs at least one lane
+  delete tr.subtitleSig;
+  tl.selectedLane = -1; tl.expandedLane = null;
+  markDirty(); await saveTranscript(); updateStats();
+  tl.static = null; if (tl.resize) tl.resize();
+  $('capOverlay').classList.add('hidden');
+  tlToast('subtitles removed');
+};
+
+// Look/size/position/highlight only change how captions are DRAWN, so they
+// apply straight away. "Words at once" changes how the transcript is chopped
+// up, so it has to rebuild the captions.
+const SUB_PREFS = ['subsStyle', 'subsSize', 'subsPos', 'subsWords', 'subsHighlight'];
+for (const id of SUB_PREFS) {
+  $(id).onchange = async () => {
+    const el = $(id);
+    localStorage.setItem('studio-' + id, el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value);
+    if (!tr) return;
+    if (id === 'subsWords' && subCues().length) {
+      capContent = '';
+      await applySubtitles(true);
+      return;
+    }
+    tr.subtitleStyle = readSubStyle();
+    capContent = '';
+    if (subCues().length) { markDirty(); await saveTranscript(); }
+    overlaySync();
+  };
+}
+
+// restore the last-used look for a session that has no captions yet
+function loadSubStylePrefs() {
+  for (const id of SUB_PREFS) {
+    const v = localStorage.getItem('studio-' + id);
+    if (v === null) continue;
+    const el = $(id);
+    if (el.type === 'checkbox') el.checked = v === '1';
+    else if ([...el.options].some(o => o.value === v)) el.value = v;
+  }
+}
+loadSubStylePrefs();
+
+function applySubStyle() {
+  const st = (tr && tr.subtitleStyle) || null;
+  if (!st) return;
+  if (st.style) $('subsStyle').value = st.style;
+  if (st.size) $('subsSize').value = st.size;
+  if (st.position) $('subsPos').value = st.position;
+  if (st.words) $('subsWords').value = st.words;
+  if (st.highlight !== undefined) $('subsHighlight').checked = st.highlight !== false;
+}
+
+function captionAt(c) {
+  return ((tr && tr.inserts) || []).find(i => i.kind === 'subtitle'
+    && c >= i.at - 0.01 && c < i.at + effDur(i)) || null;
+}
+
+// which word of `cue` is being spoken at timeline position c — a word stays
+// lit until the next one starts, matching _word_spans() in subtitles.py
+function activeWordIndex(cue, c) {
+  const ws = cue.words || [];
+  if (ws.length !== (cue.text || '').split(/\s+/).filter(Boolean).length) return -1;
+  let idx = -1;
+  for (let i = 0; i < ws.length; i++) if (c >= ws[i].s - 0.001) idx = i;
+  return idx < 0 ? 0 : idx;
+}
+
+// Draw the caption over the player using the same numbers subtitles.py uses,
+// so what you see here is what lands in the file.
+let capGeom = '';   // last applied geometry, so the rAF loop can skip re-layout
+let capContent = '';
+function syncCaption(c) {
+  const box = $('capOverlay');
+  const cue = tr ? captionAt(c) : null;
+  if (!cue || !(cue.text || '').trim()) { box.classList.add('hidden'); return; }
+  const st = subStyle();
+  const look = st.style || 'outline';
+  const text = look === 'pop' ? cue.text.toUpperCase() : cue.text;
+  const lit = st.highlight === false ? -1 : activeWordIndex(cue, c);
+  const key = `${cue.id}|${text}|${lit}`;
+  if (key !== capContent) {
+    capContent = key;
+    const words = text.split(/\s+/).filter(Boolean);
+    $('capText').innerHTML = `<span class="cbg">` + words.map((w, i) =>
+      `<span class="cw${lit < 0 || i === lit ? ' on' : ''}">${esc(w)}</span>`)
+      .join(' ') + `</span>`;
+  }
+  const cls = `cap-overlay cap-${look} cap-${st.position || 'bottom'}`;
+  if (box.className !== cls) box.className = cls;
+
+  let vx = 0, vy = 0, vw, vh;
+  if ($('playerStage').classList.contains('social')) {
+    const r = $('playerStage').getBoundingClientRect();
+    vw = r.width; vh = r.height;             // social preview crops to fill
+  } else {
+    ({ vx, vy, vw, vh } = stageVideoBox());
+  }
+  if (!vw || !vh) { box.classList.add('hidden'); return; }
+  // this runs every animation frame — only touch layout when it actually moved
+  const sig = `${vx}|${vy}|${vw}|${vh}|${st.size}|${look}`;
+  if (sig !== capGeom) {
+    capGeom = sig;
+    const fs = vh / (SUB_SIZE_DIV[st.size] || SUB_SIZE_DIV.medium);
+    box.style.left = vx + 'px';
+    box.style.top = vy + 'px';
+    box.style.width = vw + 'px';
+    box.style.height = vh + 'px';
+    box.style.fontSize = fs.toFixed(2) + 'px';
+    box.style.padding = (vh * 0.055).toFixed(1) + 'px 0';
+    $('capText').style.maxWidth =
+      Math.min(vw * 0.9, 38 * fs * (SUB_EM[look] || SUB_EM.outline)).toFixed(1) + 'px';
+  }
+  box.classList.remove('hidden');
+}
+
 $('undoAllBtn').onclick = () => {
   tr.words.forEach(w => { w.removed = false; w.reason = null; });
   tr.cutRanges = [];
@@ -979,6 +1319,7 @@ async function pollJob(name) {
       // pass so a restarting bar reads as progress, not a stuck render
       const STAGES = { composite: 'building the full composite', reframe: 'reframing',
                        cut: 'cutting the edit', mix: 'mixing music & overlays',
+                       captions: 'drawing captions',
                        denoise: 'removing background noise', compress: 'compressing to save space',
                        proxy: 'building smooth preview' };
       const stage = STAGES[j.stage] ? ` — ${STAGES[j.stage]}` : '';
@@ -1764,9 +2105,11 @@ function segAtTimeline(c) {
   return segs().find(sg => c >= sg.pos && c < sg.pos + segLen(sg)) || null;
 }
 // ALL overlays covering a timeline position, top-first (lower lane index wins).
-// Music clips are audio beds, not visual overlays — they never claim the frame.
+// Music clips are audio beds and captions are drawn text — neither is a video
+// overlay, so neither ever claims the frame.
 function overlaysAt(c) {
-  const hits = (tr.inserts || []).filter(i => i.kind !== 'music' && c >= i.at && c < i.at + effDur(i));
+  const hits = (tr.inserts || []).filter(i => i.kind !== 'music' && i.kind !== 'subtitle'
+    && c >= i.at && c < i.at + effDur(i));
   hits.sort((a, b) => trackIndex(a) - trackIndex(b));
   return hits;
 }
@@ -1838,12 +2181,16 @@ function setupTimelineContextMenu() {
     ctxTarget = { t: ct, ins, lane };  // t = TIMELINE position
     $('ctxRecordInsert').classList.toggle('hidden', !!ins);
     $('ctxFileInsert').classList.toggle('hidden', !!ins);
-    $('ctxOpenInsert').classList.toggle('hidden', !ins || ins.kind === 'music');
+    const caption = !!(ins && ins.kind === 'subtitle');
+    $('ctxOpenInsert').classList.toggle('hidden', !ins || ins.kind === 'music' || caption);
+    $('ctxEditCaption').classList.toggle('hidden', !caption);
     $('ctxDuplicateInsert').classList.toggle('hidden', !ins);
     $('ctxRemoveInsert').classList.toggle('hidden', !ins);
     $('ctxMusicVol').classList.toggle('hidden', !(ins && ins.kind === 'music'));
     $('ctxMusicLoop').classList.toggle('hidden', !(ins && ins.kind === 'music'));
-    if (ins && ins.kind === 'music') {
+    if (caption) {
+      $('ctxRemoveInsert').textContent = '✕ Remove this caption';
+    } else if (ins && ins.kind === 'music') {
       $('ctxMusicVol').textContent = `🎚 Music volume… (${Math.round(musicVol(ins) * 100)}%)`;
       $('ctxMusicLoop').textContent = ins.loop ? '🔁 Un-loop (one play-through)' : '🔁 Loop to fill timeline';
       $('ctxRemoveInsert').textContent = '✕ Remove music';
@@ -2099,6 +2446,21 @@ $('ctxClearCamKf').onclick = async () => {
   tlToast('📷 webcam bubble back to its recorded position throughout');
 };
 
+$('ctxEditCaption').onclick = async () => {
+  const ins = ctxTarget.ins;
+  if (!ins || ins.kind !== 'subtitle') return;
+  const text = prompt('Caption text (timing is unchanged):', ins.text || '');
+  if (text === null) return;
+  ins.text = text.replace(/\s+/g, ' ').trim();
+  ins.label = subLabel(ins.text);
+  respaceCueWords(ins);   // the transcript's word timings no longer fit
+  markDirty(); await saveTranscript();
+  tl.static = null;
+  capContent = '';
+  overlaySync();
+  tlToast(ins.text ? '💬 caption updated' : '💬 caption text cleared — it will not be drawn');
+};
+
 $('ctxAddTrack').onclick = async () => {
   const tracks = tlTracks();
   tracks.push({ id: `t${Date.now().toString(36)}`, name: `Track ${tracks.length + 1}` });
@@ -2155,12 +2517,16 @@ function tlRedrawStatic() {
       if (!visible(a, b)) continue;
       g.fillStyle = tl.insDrag && tl.insDrag.ins.id === ins.id
         ? 'rgba(191,90,242,1)'
-        : selected ? 'rgba(10,132,255,.9)' : 'rgba(191,90,242,.85)';
+        : selected ? 'rgba(10,132,255,.9)'
+        : ins.kind === 'subtitle' ? 'rgba(255,214,10,.8)'
+        : 'rgba(191,90,242,.85)';
       g.beginPath();
       g.roundRect(x(a), y, Math.max(6, x(b) - x(a)), h, 3 * dpr);
       g.fill();
       if (lanes[li].h >= 20) {
-        g.fillStyle = 'rgba(255,255,255,.9)';
+        // dark text on the yellow caption blocks, light on everything else
+        g.fillStyle = ins.kind === 'subtitle' && !selected
+          ? 'rgba(20,20,10,.92)' : 'rgba(255,255,255,.9)';
         g.font = `600 ${9 * dpr}px -apple-system, sans-serif`;
         g.save();
         g.beginPath(); g.rect(x(a), y, Math.max(6, x(b) - x(a)), h); g.clip();
@@ -2213,6 +2579,7 @@ function tlRedrawStatic() {
   }
   g.fillStyle = '#bf5af2';
   for (const ins of (tr.inserts || [])) {
+    if (ins.kind === 'subtitle') continue;   // captions cover the whole bar
     const a = ins.at, b = ins.at + effDur(ins);
     if (visible(a, b)) g.fillRect(x(a), H - 5, Math.max(1, x(b) - x(a)), 4);
   }
@@ -2524,6 +2891,7 @@ function overlaySync() {
   });
 
   syncMusicAudio(c);
+  syncCaption(c);
 }
 
 // live music-bed preview: a hidden audio element follows the playhead through
