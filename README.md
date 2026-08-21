@@ -65,6 +65,11 @@ Hit Record → 3-2-1 countdown → Stop. Files saved separately (raw `screen.web
 / `webcam.webm` are never modified). Then "Composite + transcribe" prepares it
 for editing.
 
+**⏸ Pause** (or press **P**) stops the recording without ending it. The paused
+stretch is left out of the file entirely rather than recorded as a freeze, so
+there is nothing to trim afterwards — take a breath, find a tab, then Resume.
+The timer freezes in amber while paused and counts only recorded time.
+
 ## 2 · Edit  (`/editor.html`)
 
 Left = video preview + controls. Right = the **transcript**. Bottom = the
@@ -122,11 +127,20 @@ Left = video preview + controls. Right = the **transcript**. Bottom = the
 - Progress shows as a % bar with stage labels and a ✕ Cancel button; resumes
   if you reload mid-render.
 
+### Deleting a recording
+
+The 🗑 on each row of the **Edit** tab's picker deletes a whole recording —
+video, transcript, every render of it, and its Google Drive copy if it was
+archived. It asks twice and names the size first, since it can be gigabytes and
+there is no undo. Two cases it refuses outright: while a job is still running,
+and when another recording plays this one as a timeline insert (deleting it
+would leave that edit with missing footage) — that one can be overridden.
+
 ## 3 · Renders  (`/renders.html`)
 
 Every finished video across all sessions, newest first, with previews +
-downloads. ⋮ menu to rename, archive or delete. Double-click a name to rename
-the recording (applies everywhere) or a specific render.
+downloads. ⋮ menu to rename, archive or delete a single render. Double-click a
+name to rename the recording (applies everywhere) or a specific render.
 
 **☁ Archive to Google Drive** in the ⋮ menu moves that one finished video to
 Drive and frees the space — handy once a render is delivered but you don't want

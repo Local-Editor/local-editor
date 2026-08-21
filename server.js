@@ -150,15 +150,24 @@ function safeMediaNames(param) {
 // deleted from the Renders page — a missing remote copy is not an error here,
 // the point is that it ends up gone.
 function rcloneDeleteFile(remotePath) {
+  return rcloneRemove(['deletefile', remotePath], remotePath);
+}
+
+// Whole remote folder, for deleting an archived recording outright.
+function rclonePurge(remotePath) {
+  return rcloneRemove(['purge', remotePath], remotePath);
+}
+
+function rcloneRemove(args, remotePath) {
   return new Promise(resolve => {
-    const child = spawn('rclone', ['deletefile', remotePath], { cwd: ROOT });
+    const child = spawn('rclone', args, { cwd: ROOT });
     let err = '';
     child.stderr.on('data', d => { err += d.toString(); });
     child.on('close', code => {
-      if (code !== 0) console.error(`[archive] rclone deletefile ${remotePath}: ${err.trim()}`);
+      if (code !== 0) console.error(`[archive] rclone ${args[0]} ${remotePath}: ${err.trim()}`);
       resolve(code === 0);
     });
-    child.on('error', e => { console.error('[archive] rclone deletefile:', e.message); resolve(false); });
+    child.on('error', e => { console.error(`[archive] rclone ${args[0]}:`, e.message); resolve(false); });
   });
 }
 
@@ -269,9 +278,17 @@ async function listSessions() {
     try { meta = JSON.parse(await fsp.readFile(path.join(dir, 'meta.json'), 'utf8')); } catch {}
     const archived = archivedMap(meta);
     const archivedNames = Object.keys(archived);
+    // on-disk media weight, so the delete confirm can say what's actually lost
+    let bytes = 0;
+    for (const n of files) {
+      if (!MEDIA_EXT.test(n) || n.startsWith('.')) continue;
+      const st = await fsp.stat(path.join(dir, n)).catch(() => null);
+      if (st) bytes += st.size;
+    }
     out.push({
       id: e.name,
       files,
+      bytes,
       createdAt: meta.createdAt || null,
       title: meta.title || e.name,
       renderNames: meta.renderNames || {},
@@ -668,6 +685,34 @@ const server = http.createServer(async (req, res) => {
       // per-file progress; this just hands it the eligible list. The list
       // ignores the enabled flag — pressing the button is its own consent.
       return json(res, 200, { candidates: await archiveCandidates(archiveConfig()) });
+    }
+
+    // Delete a whole recording: the session folder and, if it was archived,
+    // its Drive copy. Irreversible, so it refuses in the two cases where the
+    // user almost certainly doesn't mean it.
+    if (p === '/api/session' && req.method === 'DELETE') {
+      const id = safeSession(url.searchParams.get('session'));
+      const dir = sessionDir(id);
+      if (!fs.existsSync(dir)) return json(res, 404, { error: 'no such recording' });
+      if (jobs[id] && jobs[id].status === 'running') {
+        return json(res, 409, { error: `"${jobs[id].name}" is still running for this recording — cancel it first` });
+      }
+      // another recording's timeline plays footage from this one
+      const guarded = await insertSourceSessions();
+      if (guarded.has(id) && url.searchParams.get('force') !== '1') {
+        return json(res, 409, {
+          error: 'another recording uses this one as a timeline insert — deleting it would leave that edit with missing footage',
+          needsForce: true,
+        });
+      }
+      let meta = {};
+      try { meta = JSON.parse(await fsp.readFile(path.join(dir, 'meta.json'), 'utf8')); } catch {}
+      const remote = (meta.archive || {}).remote;
+      let drive = null;
+      if (remote && Object.keys(archivedMap(meta)).length) drive = await rclonePurge(remote);
+      await fsp.rm(dir, { recursive: true, force: true });
+      delete jobs[id];
+      return json(res, 200, { ok: true, deleted: id, drivePurged: drive });
     }
 
     if (p === '/api/render' && req.method === 'DELETE') {

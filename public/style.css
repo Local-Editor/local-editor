@@ -178,6 +178,8 @@ input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px;
   background: rgba(0, 0, 0, 0.5); backdrop-filter: blur(6px);
 }
 .timer { font-variant-numeric: tabular-nums; font-size: 17px; font-weight: 600; color: var(--red); }
+/* paused: amber and breathing, so a paused recording is never mistaken for a running one */
+.timer.paused { color: var(--orange); animation: pulse 1.6s infinite; }
 .status { color: var(--text-2); }
 
 .job-log {

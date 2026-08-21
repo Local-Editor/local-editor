@@ -57,6 +57,18 @@ Notes:
   `enhance.py` → `render.py` (+ `reframe.py`, `addmusic.py`, `music.py`,
   `subsession.py`, `subtitles.py`, `migrate_edits.py`, `archive.py`, shared
   helpers in `common.py`).
+- Recording pause (`public/recorder.js`) calls `MediaRecorder.pause()` on the
+  screen and webcam recorders together — verified: the paused stretch is absent
+  from the file (a 7.7 s wall-clock take with a 2 s pause ends at PTS 3.996 s),
+  not recorded as a freeze. Because they are two independent recorders, each
+  one's paused time is measured from its OWN `onpause`/`onresume` events and the
+  difference is added to `webcamOffsetSec`; the click timestamp is not good
+  enough and the error would compound over many pauses. The on-screen timer must
+  subtract paused wall time or it stops matching the file.
+- Deleting a recording is `DELETE /api/session`. It refuses while a job is
+  running, and refuses when the session is another session's insert source
+  unless `force=1` — check `insertSourceSessions()` before adding any new
+  bulk-delete path, or an edit loses its footage.
 - `scripts/archive.py` moves media to Google Drive via rclone and back, either a
   whole session (Edit tab) or single files (`--files`, used by the Renders
   page). Four rules it must keep: **verify before deleting** (`rclone check`

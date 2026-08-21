@@ -82,7 +82,11 @@ async function loadSessions() {
         <span class="hint">${s.hasComposite ? '· composite ✔' : ''}
         ${s.hasTranscript ? '· transcript ✔' : '· <em>no transcript yet</em>'}
         ${s.hasClean ? '· clean.mp4 ✔' : ''}</span>
-        <span class="sess-ctl">${cloudTag}${localCtl}${restoreBtn}</span>
+        <span class="sess-ctl">${cloudTag}${localCtl}${restoreBtn}
+          <button class="btn btn-secondary sess-delete-btn" data-id="${esc(s.id)}"
+            data-size="${a && a.whole ? (a.bytes || 0) : (s.bytes || 0)}"
+            title="Delete this recording for good — video, transcript and every render of it${a ? ', including the Google Drive copy' : ''}.">🗑</button>
+        </span>
       </p>`;
     }).join('');
   $('compressAllBtn').onclick = compressAllSessions;
@@ -193,6 +197,49 @@ $('sessionList').addEventListener('click', async e => {
     btn.disabled = false;
     alert(`${archiving ? 'Archive' : 'Restore'} failed — nothing was deleted.\n\n${archiveFailure(j)}`);
   }
+  await loadSessions();
+});
+
+// ---------- delete a whole recording ----------
+// Two-step inline confirm rather than a dialog, matching the Renders page. The
+// button states the size so "🗑" can never quietly destroy 3 GB on one click.
+$('sessionList').addEventListener('click', async e => {
+  const btn = e.target.closest('.sess-delete-btn');
+  if (!btn) return;
+  e.preventDefault();
+  const size = +btn.dataset.size || 0;
+  if (!btn.dataset.armed) {
+    btn.dataset.armed = '1';
+    btn.textContent = `🗑 Delete for good${size ? ` (${fmtGB(size)})` : ''}? Click again`;
+    btn.classList.add('btn-danger');
+    btn.dataset.reset = setTimeout(() => {
+      btn.dataset.armed = ''; btn.textContent = '🗑'; btn.classList.remove('btn-danger');
+    }, 5000);
+    return;
+  }
+  clearTimeout(+btn.dataset.reset);
+  btn.disabled = true;
+  btn.textContent = 'deleting…';
+  const force = btn.dataset.force === '1' ? '&force=1' : '';
+  const r = await fetch(`/api/session?session=${encodeURIComponent(btn.dataset.id)}${force}`,
+    { method: 'DELETE' });
+  const j = await r.json().catch(() => ({ error: 'server did not respond' }));
+  if (!r.ok) {
+    btn.disabled = false;
+    if (j.needsForce) {
+      // used as an insert elsewhere — say so, and require one more deliberate click
+      btn.dataset.force = '1';
+      btn.dataset.armed = '1';
+      btn.textContent = '⚠ another edit uses this footage — click again to delete anyway';
+    } else {
+      btn.dataset.armed = '';
+      btn.classList.remove('btn-danger');
+      btn.textContent = '🗑';
+      alert(`Could not delete.\n\n${j.error || 'unknown error'}`);
+    }
+    return;
+  }
+  archiveSummary = '';
   await loadSessions();
 });
 

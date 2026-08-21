@@ -23,6 +23,28 @@ let timerInterval = null;
 let recStartWallMs = 0;
 let startTimes = { screen: 0, webcam: 0 };
 
+// ---------- pause state ----------
+// The screen and webcam are two independent MediaRecorders, and a pause drops
+// wall time out of each one's media timeline. If they don't pause for exactly
+// the same number of milliseconds the two files drift apart, so each recorder's
+// paused time is measured from its OWN pause/resume events (not from the click)
+// and the difference is folded into webcamOffsetSec at save time.
+let paused = false;
+let pausedTotalMs = 0;        // wall time spent paused — keeps the timer honest
+let pauseWallStart = 0;
+let pausedMs = { screen: 0, webcam: 0 };
+let pauseMark = { screen: 0, webcam: 0 };
+let pauseCount = 0;
+
+function trackPauses(rec, key) {
+  if (!rec) return;
+  rec.onpause = () => { pauseMark[key] = performance.now(); };
+  rec.onresume = () => {
+    if (pauseMark[key]) pausedMs[key] += performance.now() - pauseMark[key];
+    pauseMark[key] = 0;
+  };
+}
+
 if (insertFor) {
   // textContent, not HTML — insertFor comes from the URL, so any page could
   // link here with markup in the parameter
@@ -313,23 +335,84 @@ function startRecording() {
   if (screenRec) screenRec.start(1000);
   if (camRec) camRec.start(1000);
 
+  trackPauses(screenRec, 'screen');
+  trackPauses(camRec, 'webcam');
+  paused = false;
+  pausedTotalMs = 0;
+  pausedMs = { screen: 0, webcam: 0 };
+  pauseMark = { screen: 0, webcam: 0 };
+  pauseCount = 0;
+
   recording = true;
   recStartWallMs = Date.now();
   $('recordBtn').textContent = '■ Stop';
   $('recordBtn').classList.add('recording');
+  $('pauseBtn').textContent = '⏸ Pause';
+  $('pauseBtn').classList.remove('hidden');
   const t0 = Date.now();
   timerInterval = setInterval(() => {
-    const s = Math.floor((Date.now() - t0) / 1000);
+    // paused stretches never reach the file, so they must not reach the clock
+    const s = Math.floor((Date.now() - t0 - pausedTotalMs - (paused ? Date.now() - pauseWallStart : 0)) / 1000);
     $('timer').textContent = `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
   }, 250);
   setStatus('Recording…');
 }
 
+// Pause both recorders together. MediaRecorder.pause() simply stops feeding the
+// muxer, so the paused stretch is absent from the file rather than recorded as
+// a freeze — nothing to trim out afterwards.
+function togglePause() {
+  if (!recording) return;
+  const recs = [screenRec, camRec].filter(r => r && r.state !== 'inactive');
+  if (!recs.length) return;
+  if (!paused) {
+    for (const r of recs) { try { r.pause(); } catch {} }
+    paused = true;
+    pauseWallStart = Date.now();
+    pauseCount++;
+    $('pauseBtn').textContent = '▶ Resume';
+    $('recordBtn').classList.remove('recording');   // stop the red pulse
+    $('timer').classList.add('paused');
+    setStatus('Paused — press Resume to carry on, or Stop to finish.');
+  } else {
+    for (const r of recs) { try { r.resume(); } catch {} }
+    paused = false;
+    pausedTotalMs += Date.now() - pauseWallStart;
+    $('pauseBtn').textContent = '⏸ Pause';
+    $('recordBtn').classList.add('recording');
+    $('timer').classList.remove('paused');
+    setStatus('Recording…');
+  }
+}
+
+$('pauseBtn').onclick = togglePause;
+
+// P toggles pause while recording — but never while the user is typing
+document.addEventListener('keydown', e => {
+  if (e.key !== 'p' && e.key !== 'P') return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName || '')) || e.target.isContentEditable) return;
+  if (!recording) return;
+  e.preventDefault();
+  togglePause();
+});
+
 function stopRecording() {
+  // A recorder stopped while paused still finalises, but the pause has to be
+  // closed out first or its duration is never added to pausedMs.
+  if (paused) {
+    pausedTotalMs += Date.now() - pauseWallStart;
+    for (const r of [screenRec, camRec]) {
+      if (r && r.state === 'paused') { try { r.resume(); } catch {} }
+    }
+    paused = false;
+  }
   recording = false;
   clearInterval(timerInterval);
   $('recordBtn').textContent = '● Record';
   $('recordBtn').classList.remove('recording');
+  $('pauseBtn').classList.add('hidden');
+  $('timer').classList.remove('paused');
   setStatus('Saving…');
   try { screenRec && screenRec.state !== 'inactive' && screenRec.stop(); } catch {}
   try { camRec && camRec.state !== 'inactive' && camRec.stop(); } catch {}
@@ -361,8 +444,20 @@ async function doSave(up, screenChunks, camChunks, mime) {
     mode,
     screenStartMs: startTimes.screen,
     webcamStartMs: startTimes.webcam,
-    // + means webcam recorder started AFTER the screen recorder
-    webcamOffsetSec: (camRec && screenRec) ? (startTimes.webcam - startTimes.screen) / 1000 : 0,
+    // + means webcam recorder started AFTER the screen recorder.
+    // Each pause removes wall time from a recorder's media timeline, so if the
+    // two recorders were paused for slightly different durations the webcam
+    // sits (pausedScreen - pausedWebcam) further along its own timeline than
+    // the start-time estimate alone implies. Usually sub-frame, but it would
+    // otherwise accumulate over a long recording with many pauses.
+    webcamOffsetSec: (camRec && screenRec)
+      ? (startTimes.webcam - startTimes.screen) / 1000
+        + (pausedMs.screen - pausedMs.webcam) / 1000
+      : 0,
+    pauses: pauseCount,
+    pausedSec: +(pausedTotalMs / 1000).toFixed(3),
+    pausedPerTrackSec: { screen: +(pausedMs.screen / 1000).toFixed(3),
+                         webcam: +(pausedMs.webcam / 1000).toFixed(3) },
     screenSize: { w: $('screenPreview').videoWidth, h: $('screenPreview').videoHeight },
     hasWebcam: !!camRec && camStream.getVideoTracks().length > 0,
     micOnly: !!camRec && camStream.getVideoTracks().length === 0,
