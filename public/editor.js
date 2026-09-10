@@ -430,6 +430,10 @@ async function openSession() {
   }
   tr = await res.json();
   tr.settings = tr.settings || { padSec: 0.12, maxGapSec: 1.0 };
+  healDuration();
+  $('player').addEventListener('loadedmetadata', () => {
+    if (healDuration()) { updateStats(); tlSetup(); }
+  });
   migrateCamKeyframes();
   applySubStyle();
   histReset();   // undo baseline = the transcript as loaded
@@ -633,6 +637,28 @@ function layoutAt(t) {
   if (sg && sg.cam) Object.assign(eff, sg.cam);
   return eff;
 }
+// A transcript whose duration never got measured (0) materializes a zero-length
+// arrangement — "After cuts 0:00", nothing on the timeline, an empty render.
+// Repair it from the media itself; the words are a floor while metadata loads.
+function healDuration() {
+  const media = $('player').duration;
+  const lastWord = tr.words && tr.words.length ? tr.words[tr.words.length - 1].end : 0;
+  const real = (Number.isFinite(media) && media > 0) ? media : (lastWord ? lastWord + 0.5 : 0);
+  if (!real) return false;
+  let healed = false;
+  if (!(tr.duration > 0) || tr.duration < lastWord) {
+    tr.duration = Math.round(real * 1000) / 1000;
+    healed = true;
+  }
+  const sg = tr.segments;
+  if (sg && sg.length === 1 && sg[0].s0 <= 0.001 && sg[0].s1 - sg[0].s0 <= 0.001) {
+    tr.segments = [{ ...sg[0], id: sg[0].id || 'seg1', s0: 0, s1: tr.duration, pos: 0 }];
+    healed = true;
+  }
+  if (healed) console.warn(`[editor] repaired a 0-length edit: duration is now ${tr.duration}s`);
+  return healed;
+}
+
 // one-time migration of the old keyframe model onto pieces
 function migrateCamKeyframes() {
   const kfs = tr.camLayouts || [];
@@ -2333,7 +2359,12 @@ function insTotal() {
 // ---------- main-track segments (scissor splits; draggable arrangement) ----------
 function segs() {
   if (!tr.segments || !tr.segments.length) {
-    tr.segments = [{ id: 'seg1', s0: 0, s1: tr.duration || 0, pos: 0 }];
+    // never materialize a 0-length arrangement — a transcript can carry
+    // duration 0 if it was written while composite.mp4 was still being made,
+    // and persisting seg1 [0,0] leaves an empty timeline that renders nothing
+    const dur = tr.duration || $('player').duration || 0;
+    if (!dur) return [];
+    tr.segments = [{ id: 'seg1', s0: 0, s1: dur, pos: 0 }];
   }
   return tr.segments.slice().sort((a, b) => a.pos - b.pos);
 }

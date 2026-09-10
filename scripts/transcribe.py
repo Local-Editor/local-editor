@@ -203,7 +203,20 @@ def main():
         print(f"shifted {len(words)} words by {offset:+.3f}s onto the composite timeline")
 
     composite = d / "composite.mp4"
-    duration = duration_of(composite if composite.exists() else source)
+    measured = composite if composite.exists() else source
+    duration = duration_of(measured)
+
+    # A duration of 0 (or one that does not even reach the last word) means the
+    # probe failed — a half-written composite, a container with no duration
+    # header. Writing it through would materialize a zero-length arrangement in
+    # the editor: "After cuts 0:00", an empty timeline and a render with nothing
+    # in it. The speech we just transcribed is a safe floor.
+    last_word = max((w["end"] for w in words), default=0.0)
+    if duration < last_word + 0.001:
+        print(f"WARNING: {measured.name} reported {duration:.3f}s, which is "
+              f"shorter than the speech in it ({last_word:.3f}s) — falling back "
+              f"to the transcript's own length")
+        duration = last_word + 0.5
 
     transcript = {
         "language": info.language,

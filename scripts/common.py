@@ -22,6 +22,26 @@ def has_audio(info):
     return any(s["codec_type"] == "audio" for s in info["streams"])
 
 
+def _packet_end(path, select):
+    """End time of the last packet of a stream, or 0 if it has none."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-select_streams", select, "-show_entries",
+         "packet=pts_time,duration_time", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True).stdout.strip().splitlines()
+    if not out:
+        return 0.0
+    parts = (out[-1].split(",") + [""])[:2]
+    try:
+        end = float(parts[0])
+    except ValueError:
+        return 0.0
+    try:
+        end += float(parts[1])              # packet duration, when known
+    except ValueError:
+        pass
+    return end
+
+
 def duration_of(path):
     """Container duration; falls back to decoding (MediaRecorder webm often
     has no duration header)."""
@@ -29,11 +49,20 @@ def duration_of(path):
     d = info.get("format", {}).get("duration")
     if d and float(d) > 0:
         return float(d)
-    out = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-select_streams", "v:0", "-show_entries",
-         "packet=pts_time", "-of", "csv=p=0", str(path)],
-        capture_output=True, text=True).stdout.strip().splitlines()
-    return float(out[-1]) if out else 0.0
+    for s in info.get("streams", []):        # some containers carry it per-stream
+        try:
+            if float(s.get("duration") or 0) > 0:
+                return float(s["duration"])
+        except ValueError:
+            pass
+    # Last resort: read packet timestamps. Try video first, then audio — a
+    # mic-only recording (screen-only mode) has no video stream at all, and
+    # asking for v:0 there silently returned 0 and wrecked the edit downstream.
+    for sel in ("v:0", "a:0"):
+        end = _packet_end(path, sel)
+        if end > 0:
+            return end
+    return 0.0
 
 
 def run_ffmpeg(args):
