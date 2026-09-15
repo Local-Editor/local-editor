@@ -2427,9 +2427,9 @@ function finalDuration() {
 // ---------- lanes (click a lane to expand it; others shrink) ----------
 function laneMetrics() {
   const tracks = tlTracks();
-  const hs = tracks.map((_, i) =>
-    tl.expandAll ? 30 :
-    tl.expandedLane == null ? 13 : (i === tl.expandedLane ? 30 : 8));
+  // 13px is the floor: collapsing the others to 8px made them so thin that the
+  // expanded lane was the only one you could reliably click
+  const hs = tracks.map((_, i) => (tl.expandAll || i === tl.expandedLane) ? 30 : 13);
   let y = 2;
   const lanes = hs.map(h => { const o = { y, h }; y += h; return o; });
   return { lanes, total: y + 2 };
@@ -2620,28 +2620,58 @@ $('insertFile').onchange = async e => {
   const file = e.target.files[0];
   e.target.value = '';
   if (!file) return;
-  const dur = await mediaDuration(file);
   const ext = (file.name.split('.').pop() || 'mp4').toLowerCase().replace(/[^\w]/g, '');
   const name = `insert-${Date.now().toString(36)}.${ext}`;
-  await fetch(`/api/upload?session=${sessionId}&name=${name}`, { method: 'POST', body: file });
-  tr.inserts = tr.inserts || [];
-  tr.inserts.push({
-    id: `ins-${Date.now().toString(36)}`, at: Math.round(ctxTarget.t * 1000) / 1000,
+  const [dur] = await Promise.all([
+    mediaDuration(file),
+    fetch(`/api/upload?session=${sessionId}&name=${name}`, { method: 'POST', body: file }),
+  ]);
+  const at = Math.round(ctxTarget.t * 1000) / 1000;
+  const ins = {
+    id: `ins-${Date.now().toString(36)}`, at,
     file: name, kind: file.type.startsWith('audio') ? 'audio' : 'video',
     duration: Math.round(dur * 100) / 100, label: file.name,
     track: tlTracks()[Math.max(0, ctxTarget.lane)].id,
-  });
+  };
+  tr.inserts = tr.inserts || [];
+  tr.inserts.push(ins);
   markDirty(); await saveTranscript();
   updateStats();
-  tlToast(`🎞 “${file.name}” inserted at ${fmtSec(ctxTarget.t)} — it will be spliced in at render`);
+  tlToast(`🎞 “${file.name}” inserted at ${fmtSec(at)} — it will be spliced in at render`);
+  // Chrome can't decode ProRes/DNxHD, so mediaDuration comes back 0 and the clip
+  // would sit on the timeline with no length, playing nothing. ffmpeg can read
+  // it: take the real duration from the server and show a preview copy.
+  if (!dur) await prepareUnplayableInsert(ins);
 };
+
+async function prepareUnplayableInsert(ins) {
+  tlToast(`⏳ “${ins.label}” isn't a format the browser plays — measuring it and building a preview copy…`);
+  let r;
+  try {
+    r = await (await fetch(`/api/insert-prepare?session=${sessionId}&file=${encodeURIComponent(ins.file)}`,
+                           { method: 'POST' })).json();
+  } catch { r = null; }
+  if (!r || r.error || !r.duration) {
+    tlToast(`⚠️ couldn't read “${ins.label}” — drag its edge to give it a length, or use an mp4/webm`);
+    return;
+  }
+  ins.duration = Math.round(r.duration * 100) / 100;
+  markDirty(); await saveTranscript();
+  tl.static = null; updateStats();
+  tlToast(`🎞 “${ins.label}” is ${fmtSec(ins.duration)} long${r.started ? ' — building the preview copy…' : ''}`);
+  if (!r.started) return;
+  const j = await pollJob('proxy');
+  if (j.status !== 'done') { tlToast('⚠️ preview copy failed — the clip still renders from the original'); return; }
+  ins.proxy = r.proxy;
+  markDirty(); await saveTranscript();
+  tl.static = null;
+  tlToast(`✅ “${ins.label}” is ready to preview${r.alpha ? ' (transparent)' : ''} — the render uses the original`);
+}
 
 $('ctxOpenInsert').onclick = () => {
   const ins = ctxTarget.ins;
   if (!ins) return;
-  const url = ins.fromSession
-    ? `/recordings/${encodeURIComponent(ins.fromSession)}/composite.mp4`
-    : `/recordings/${sessionId}/${encodeURIComponent(ins.file)}`;
+  const url = insertUrl(ins);
   window.open(url, '_blank');
 };
 
@@ -3076,9 +3106,12 @@ let lastMainT = 0;
 
 function insertUrl(ins) {
   if (ins.musicTrack) return `/music/${encodeURIComponent(ins.musicTrack)}`;
-  return ins.fromSession
-    ? `/recordings/${encodeURIComponent(ins.fromSession)}/${encodeURIComponent(ins.fromFile || 'composite.mp4')}`
-    : `/recordings/${sessionId}/${encodeURIComponent(ins.file)}`;
+  if (ins.fromSession) {
+    return `/recordings/${encodeURIComponent(ins.fromSession)}/${encodeURIComponent(ins.fromFile || 'composite.mp4')}`;
+  }
+  // ins.proxy exists only for formats <video> can't decode; the render still
+  // uses ins.file, which ffmpeg reads at full quality
+  return `/recordings/${sessionId}/${encodeURIComponent(ins.proxy || ins.file)}`;
 }
 
 function curTimelineTime() {
@@ -3385,7 +3418,7 @@ function stageVideoBox() {
 
 // transparent overlay assets (VP9-alpha webm) get no plate, shadow, or corner
 // rounding — the alpha IS the shape
-function isAlphaIns(i) { return /\.webm$/i.test((i && (i.fromFile || i.file || i.musicTrack)) || ''); }
+function isAlphaIns(i) { return /\.webm$/i.test((i && (i.proxy || i.fromFile || i.file || i.musicTrack)) || ''); }
 
 function placeInsertFrame(ov, ip = $('insertPlayer')) {
   if (!ov || !ov.frame) {

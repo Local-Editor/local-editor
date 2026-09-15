@@ -92,10 +92,12 @@ async function sessionArchiveInfo(id) {
   };
 }
 
-// Sessions another session pulls inserts from must keep their media, or the
-// borrowing edit loses its footage. Returns a Set of protected session ids.
-async function insertSourceSessions() {
-  const protectedIds = new Set();
+// Media another session pulls inserts from must stay on disk, or the borrowing
+// edit loses its footage. Returns Map<session id, Set of file names in use> —
+// file-level because the Renders page archives individual files, and one
+// borrowed asset clip has to survive even when the rest of its folder is stale.
+async function insertSourceFiles() {
+  const used = new Map();
   const entries = await fsp.readdir(RECORDINGS, { withFileTypes: true }).catch(() => []);
   for (const e of entries) {
     if (!e.isDirectory()) continue;
@@ -103,10 +105,17 @@ async function insertSourceSessions() {
     try { trs = JSON.parse(await fsp.readFile(path.join(RECORDINGS, e.name, 'transcript.json'), 'utf8')); }
     catch { continue; }
     for (const ins of trs.inserts || []) {
-      if (ins.fromSession && ins.fromSession !== e.name) protectedIds.add(ins.fromSession);
+      if (!ins.fromSession || ins.fromSession === e.name) continue;
+      if (!used.has(ins.fromSession)) used.set(ins.fromSession, new Set());
+      used.get(ins.fromSession).add(ins.fromFile || 'composite.mp4');   // render.py's default
     }
   }
-  return protectedIds;
+  return used;
+}
+
+// Protected session ids, for the calls that move or delete a whole recording.
+async function insertSourceSessions() {
+  return new Set((await insertSourceFiles()).keys());
 }
 
 async function archiveCandidates(cfg) {
@@ -144,6 +153,32 @@ function safeMediaNames(param) {
   if (!names.length) return null;
   if (!names.every(n => safeName(n) && MEDIA_EXT.test(n))) throw new Error('bad file name');
   return names;
+}
+
+// Media facts straight from ffmpeg, for the things a browser cannot tell us.
+function probeMedia(file) {
+  return new Promise(resolve => {
+    const child = spawn('ffprobe', ['-v', 'quiet', '-print_format', 'json',
+                                    '-show_format', '-show_streams', file]);
+    let out = '';
+    child.stdout.on('data', d => { out += d.toString(); });
+    child.on('close', () => {
+      let info = null;
+      try { info = JSON.parse(out); } catch {}
+      if (!info) return resolve(null);
+      const v = (info.streams || []).find(st => st.codec_type === 'video');
+      const pix = (v && v.pix_fmt) || '';
+      const tags = Object.fromEntries(Object.entries((v && v.tags) || {})
+        .map(([k, val]) => [k.toLowerCase(), val]));
+      resolve({
+        duration: parseFloat((info.format || {}).duration) || 0,
+        // VP9 hides alpha behind a tag rather than the pixel format
+        alpha: /^(yuva|rgba|argb|bgra|gbrap)/.test(pix) || tags.alpha_mode === '1',
+        codec: (v && v.codec_name) || null,
+      });
+    });
+    child.on('error', () => resolve(null));
+  });
 }
 
 // Delete one file from the remote. Used when a render that lives on Drive is
@@ -369,6 +404,29 @@ const server = http.createServer(async (req, res) => {
       file.on('finish', () => json(res, 200, { ok: true, saved: `${id}/${name}` }));
       file.on('error', err => json(res, 500, { error: err.message }));
       return;
+    }
+
+    // A clip the browser cannot decode (ProRes, DNxHD, …) uploads fine and
+    // renders fine — ffmpeg reads it — but <video> reports no duration, so the
+    // clip used to land on the timeline zero seconds long and silently play
+    // nothing. Probe it properly, and build a preview copy the browser can show.
+    if (p === '/api/insert-prepare' && req.method === 'POST') {
+      const id = safeSession(url.searchParams.get('session'));
+      const names = safeMediaNames(url.searchParams.get('file'));
+      if (!names || names.length !== 1) return json(res, 400, { error: 'bad file name' });
+      const file = names[0];
+      const src = path.join(sessionDir(id), file);
+      if (!fs.existsSync(src)) return json(res, 404, { error: 'no such file' });
+      const info = await probeMedia(src);
+      if (!info || !info.duration) return json(res, 422, { error: `ffmpeg could not read ${file}` });
+      const proxy = `proxy-${file.replace(/\.[^.]+$/, '')}.${info.alpha ? 'webm' : 'mp4'}`;
+      let started = true;
+      // the duration alone already makes the clip work; the preview is a bonus,
+      // so a busy session is not an error here
+      try { runJob(id, 'proxy', PYTHON, [path.join(SCRIPTS, 'proxy.py'), sessionDir(id), '--insert', file]); }
+      catch { started = false; }
+      return json(res, 200, { ok: true, duration: info.duration, alpha: info.alpha,
+                              codec: info.codec, proxy, started });
     }
 
     if (p === '/api/transcript' && req.method === 'GET') {
@@ -632,7 +690,20 @@ const server = http.createServer(async (req, res) => {
       const cfg = archiveConfig();
       // an explicit button press is a backup+reclaim even when the sweep is off
       if (url.searchParams.get('keep') === '1') cfg.keepLocal = true;
-      startArchiveJob(id, 'archive', cfg, safeMediaNames(url.searchParams.get('files')));
+      const files = safeMediaNames(url.searchParams.get('files'));
+      // footage another edit plays stays put unless the press says otherwise
+      const inUse = (await insertSourceFiles()).get(id);
+      if (inUse && !cfg.keepLocal && url.searchParams.get('force') !== '1') {
+        const clash = files ? files.filter(f => inUse.has(f)) : [...inUse];
+        if (clash.length) {
+          return json(res, 409, {
+            error: `cannot archive ${clash.join(', ')} — another recording plays it as a timeline insert, `
+                 + 'and moving it to Drive would leave that edit with missing footage',
+            needsForce: true, files: clash,
+          });
+        }
+      }
+      startArchiveJob(id, 'archive', cfg, files);
       return json(res, 200, { ok: true, started: 'archive' });
     }
 
@@ -651,6 +722,8 @@ const server = http.createServer(async (req, res) => {
       const days = isFinite(d) && d >= 0 ? d : cfg.rendersOlderThanDays;
       const cutoff = Date.now() - days * 86400000;
       const groups = [];
+      const borrowed = await insertSourceFiles();
+      let held = 0;
       const entries = await fsp.readdir(RECORDINGS, { withFileTypes: true }).catch(() => []);
       for (const e of entries) {
         if (!e.isDirectory()) continue;
@@ -659,10 +732,12 @@ const server = http.createServer(async (req, res) => {
         let meta = {};
         try { meta = JSON.parse(await fsp.readFile(path.join(dir, 'meta.json'), 'utf8')); } catch {}
         const archived = archivedMap(meta);
+        const inUse = borrowed.get(e.name) || new Set();
         const picked = [];
         let bytes = 0, oldest = Infinity;
         for (const f of await fsp.readdir(dir).catch(() => [])) {
           if (!renderKind(f) || archived[f]) continue;         // already on Drive
+          if (inUse.has(f)) { held++; continue; }              // another edit plays it
           const st = await fsp.stat(path.join(dir, f)).catch(() => null);
           if (!st || !st.size || st.mtimeMs > cutoff) continue;
           picked.push(f); bytes += st.size; oldest = Math.min(oldest, st.mtimeMs);
@@ -674,7 +749,7 @@ const server = http.createServer(async (req, res) => {
       }
       groups.sort((a, b) => a.mtime - b.mtime);                // oldest first
       return json(res, 200, {
-        days, groups,
+        days, groups, held,
         files: groups.reduce((s, g) => s + g.files.length, 0),
         bytes: groups.reduce((s, g) => s + g.bytes, 0),
       });

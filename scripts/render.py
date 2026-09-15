@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (ffprobe, has_audio, duration_of, run_ffmpeg, load_json,
                     keep_segments, encode_args, video_stream, clean_time, even,
-                    compress_to_hevc)
+                    compress_to_hevc, stream_has_alpha)
 import subtitles
 
 
@@ -130,17 +130,6 @@ def resolve_insert(d, ins):
         return comp if comp.exists() else None
     f = d / ins.get("file", "")
     return f if f.exists() else None
-
-
-def stream_has_alpha(vs):
-    """True when the video stream carries an alpha channel (ProRes 4444,
-    VP9-alpha webm, PNG-style formats). VP9 hides it behind a tag."""
-    if not vs:
-        return False
-    if vs.get("pix_fmt", "").startswith(("yuva", "rgba", "argb", "bgra", "gbrap")):
-        return True
-    tags = {k.lower(): v for k, v in (vs.get("tags") or {}).items()}
-    return tags.get("alpha_mode") == "1"
 
 
 def normalize_overlay(d, ins, W, H, fps, quality, tmpdir, k):

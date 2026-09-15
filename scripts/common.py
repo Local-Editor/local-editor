@@ -42,6 +42,17 @@ def _packet_end(path, select):
     return end
 
 
+def stream_has_alpha(vs):
+    """True when the video stream carries an alpha channel (ProRes 4444,
+    VP9-alpha webm, PNG-style formats). VP9 hides it behind a tag."""
+    if not vs:
+        return False
+    if vs.get("pix_fmt", "").startswith(("yuva", "rgba", "argb", "bgra", "gbrap")):
+        return True
+    tags = {k.lower(): v for k, v in (vs.get("tags") or {}).items()}
+    return tags.get("alpha_mode") == "1"
+
+
 def duration_of(path):
     """Container duration; falls back to decoding (MediaRecorder webm often
     has no duration header)."""

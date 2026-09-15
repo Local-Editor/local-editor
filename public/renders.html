@@ -96,9 +96,11 @@ async function loadArchivePanel() {
   catch { return; }
   $r('rArchiveBtn').disabled = !d.files || bulkBusy;
   if (bulkBusy) return;
+  // say what was held back rather than quietly leaving it out of the count
+  const held = d.held ? ` · ${d.held} kept here (another edit plays it)` : '';
   $r('rStatus').textContent = bulkSummary || (d.files
-    ? `${d.files} render${d.files > 1 ? 's' : ''} older than ${d.days} day${d.days === 1 ? '' : 's'} (${fmtSize(d.bytes)})`
-    : `no renders older than ${d.days} day${d.days === 1 ? '' : 's'}`);
+    ? `${d.files} render${d.files > 1 ? 's' : ''} older than ${d.days} day${d.days === 1 ? '' : 's'} (${fmtSize(d.bytes)})${held}`
+    : `no renders older than ${d.days} day${d.days === 1 ? '' : 's'}${held}`);
 }
 
 // Archive every eligible render, one recording at a time so each upload
