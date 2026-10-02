@@ -63,7 +63,8 @@ infinity-mirror; your own recorder tab is excluded from the picker.
 
 Hit Record → 3-2-1 countdown → Stop. Files saved separately (raw `screen.webm`
 / `webcam.webm` are never modified). Then "Composite + transcribe" prepares it
-for editing.
+for editing — the two run side by side, so the transcript is ready in about
+the time transcription alone takes.
 
 **⏸ Pause** (or press **P**) stops the recording without ending it. The paused
 stretch is left out of the file entirely rather than recorded as a freeze, so
@@ -107,10 +108,11 @@ Left = video preview + controls. Right = the **transcript**. Bottom = the
   bubble-overlay). Live preview updates when you pick a format.
 - Quality: High / Balanced / Small. Uses the Mac's hardware encoder (fast).
   The whole edit — cuts, pieces, gaps, overlays, music, captions — renders in
-  **one pass**, so every frame is encoded exactly once: no quality lost to
-  intermediate files, and a render with overlays or captions takes about as
-  long as one without. "Compress to save space" encodes H.265 in that same
-  pass (~30% smaller).
+  **one pass** straight from your raw recordings, so every frame is encoded
+  exactly once: no quality lost to intermediate files, a render with overlays
+  or captions takes about as long as one without, and moving the webcam bubble
+  doesn't trigger a rebuild first. "Compress to save space" encodes H.265 in
+  that same pass (~30% smaller).
 - 💬 **Subtitles in one click**: "Add subtitles" reads the transcript and drops
   a caption clip onto a Subtitles timeline for every phrase you kept. Drag,
   trim, duplicate or right-click one to retype it, like any clip. Three looks

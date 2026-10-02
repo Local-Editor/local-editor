@@ -494,8 +494,7 @@ $('processBtn').onclick = async () => {
   $('processBtn').disabled = true;
   $('jobLog').classList.remove('hidden');
   try {
-    await runJob('composite');
-    await runJob('transcribe');
+    await runJob('process');      // transcription + composite, side by side
     $('jobLog').textContent += '\nAll done — open the editor to review the transcript.';
   } catch (e) {
     $('jobLog').textContent += `\n⚠ ${e.message}`;

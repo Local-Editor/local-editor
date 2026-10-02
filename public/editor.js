@@ -1613,6 +1613,7 @@ $('undoAllBtn').onclick = () => {
 
 const JOB_LABELS = {
   render: 'Rendering clean video', transcribe: 'Transcribing', composite: 'Compositing',
+  process: 'Transcribing + compositing',
   addmusic: 'Adding music', enhance: 'AI clean-up', subsession: 'Creating edit session',
   'compress-files': 'Compressing edit files', proxy: 'Building smooth preview',
   archive: 'Archiving to Google Drive', restore: 'Restoring from Google Drive',

@@ -46,6 +46,26 @@ def _packet_end(path, select):
     return end
 
 
+def missing_frames(path):
+    """How many frames a constant-rate encode came out short of its own
+    duration (0 = complete). Under heavy load the hardware encoder has been
+    seen to discard a few frames with no error at all; each one is a hitch."""
+    vs = video_stream(ffprobe(path))
+    try:
+        num, den = (int(x) for x in vs["r_frame_rate"].split("/"))
+        return max(0, round(float(vs["duration"]) * num / den) - int(vs["nb_frames"]))
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return 0
+
+
+def warn_if_frames_missing(path):
+    n = missing_frames(path)
+    if n:
+        print(f"WARNING: {Path(path).name} is missing {n} frame(s) — the encoder "
+              f"dropped them, which has only been seen while the Mac was heavily "
+              f"loaded. Run it again with less going on for a clean copy.", flush=True)
+
+
 def stream_has_alpha(vs):
     """True when the video stream carries an alpha channel (ProRes 4444,
     VP9-alpha webm, PNG-style formats). VP9 hides it behind a tag."""
@@ -101,6 +121,27 @@ def build_then_swap(final, build):
         return result
     finally:
         tmp.unlink(missing_ok=True)
+
+
+class Graph:
+    """One ffmpeg invocation — its inputs and filtergraph, built up piecewise."""
+
+    def __init__(self):
+        self.inputs, self.parts, self._n = [], [], 0
+
+    def input(self, args):
+        self.inputs.append([str(a) for a in args])
+        return len(self.inputs) - 1
+
+    def label(self, kind):
+        self._n += 1
+        return f"[{kind}{self._n}]"
+
+    def add(self, chain):
+        self.parts.append(chain)
+
+    def args(self):
+        return [a for inp in self.inputs for a in inp]
 
 
 def run_ffmpeg(args):

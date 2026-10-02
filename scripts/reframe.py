@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from common import (ffprobe, video_stream, has_audio, duration_of, run_ffmpeg,
                     even, write_rounded_mask_png, load_json, encode_args,
                     normalize_audio_timeline, build_then_swap, exit_on_sigterm)
-from composite import mic_chain, mic_input
+from composite import mic_chain, mic_input, SYSTEM_MIX
 
 CANVAS = {"short": (1080, 1920), "square": (1080, 1080)}
 # Lanczos, not swscale's default bicubic: shorts shrink the screen ~3x and
@@ -115,7 +115,7 @@ def main():
         inputs += mic_extra
         if screen_audio:
             graph += (f";{mic_chain(mic_i, trim_s, delay_ms, '[mic]')}"
-                      f";[0:a][mic]amix=inputs=2:duration=longest:weights=0.6 1.0,asetpts=N/SR/TB[a]")
+                      f";[0:a][mic]{SYSTEM_MIX},asetpts=N/SR/TB[a]")
         else:
             graph += f";{mic_chain(mic_i, trim_s, delay_ms, '[a]')}"
         audio_map = ["-map", "[a]"]
