@@ -1,6 +1,10 @@
 """Shared helpers for Screen Studio scripts."""
 import json
+import math
+import os
+import signal
 import subprocess
+import sys
 import zlib
 import struct
 from pathlib import Path
@@ -76,6 +80,29 @@ def duration_of(path):
     return 0.0
 
 
+def exit_on_sigterm():
+    """Cancelling a job SIGTERMs its whole process group. Python's default is
+    to die on the spot, skipping every `finally` — which is where half-written
+    outputs get removed. Exit through them instead."""
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+
+
+def build_then_swap(final, build):
+    """Run `build(tmp_path)` and move the result over `final` only once it
+    succeeds. A build that is cancelled or fails part-way otherwise leaves a
+    perfectly valid, too-SHORT file under the real name — and the next render
+    reuses it without a word. The temp name keeps the .mp4 extension (ffmpeg
+    picks the muxer from it) and a leading dot (the UI lists no such file)."""
+    final = Path(final)
+    tmp = final.with_name(f".{final.stem}.building{final.suffix}")
+    try:
+        result = build(tmp)
+        os.replace(tmp, final)
+        return result
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def run_ffmpeg(args):
     cmd = ["ffmpeg", "-hide_banner", "-y"] + args
     print("+", " ".join(str(a) for a in cmd), flush=True)
@@ -87,94 +114,93 @@ def even(n):
     return n if n % 2 == 0 else n + 1
 
 
-_has_vt = None
-
-# quality tier -> (videotoolbox -q:v, libx264 -crf)
-QUALITY = {"high": ("72", "16"), "balanced": ("60", "19"), "small": ("46", "24")}
+_encoders = None
 
 
-def encode_args(quality="balanced"):
+def _has_encoder(name):
+    global _encoders
+    if _encoders is None:
+        _encoders = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                                   capture_output=True, text=True).stdout
+    return name in _encoders
+
+
+# Keyframe interval, in frames (2s at 30fps). Left unset, ffmpeg hands
+# VideoToolbox its generic default of 12 — a full keyframe every 0.4s, which
+# spends most of the bitrate re-sending a screen that barely changes. libx264
+# and libx265 pick their own (longer) interval and don't need it.
+GOP = "60"
+
+# quality tier -> (videotoolbox h264 -q:v, libx264 -crf,
+#                  videotoolbox hevc -q:v, libx265 -crf)
+# Calibrated by SSIM against the source on real screen recordings: with the 2s
+# keyframe interval each tier is sharper AND 12-20% smaller than the old
+# 0.4s-keyframe tiers (72/60/46), and the H.265 column is ~30% smaller than
+# the H.264 one while still beating the old two-pass "compress" output.
+QUALITY = {"high": ("80", "16", "74", "18"),
+           "balanced": ("75", "19", "68", "21"),
+           "small": ("62", "24", "60", "26")}
+
+
+def encode_args(quality="balanced", hevc=False):
     """Video+audio encode settings. Prefers Apple's hardware encoder
     (VideoToolbox Media Engine, constant-quality mode) — 5-10x faster than
     libx264 on M-series; bitrate adapts to content so static screen shares
-    stay small."""
-    global _has_vt
-    if _has_vt is None:
-        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
-                             capture_output=True, text=True).stdout
-        _has_vt = "h264_videotoolbox" in out
-    qv, crf = QUALITY.get(quality, QUALITY["balanced"])
-    if _has_vt:
-        video = ["-c:v", "h264_videotoolbox", "-q:v", qv, "-pix_fmt", "yuv420p"]
+    stay small. hevc=True encodes H.265 instead: ~30% fewer bytes for
+    near-identical quality (the "compress to save space" option)."""
+    vt264, x264, vt265, x265 = QUALITY.get(quality, QUALITY["balanced"])
+    if hevc:
+        if _has_encoder("hevc_videotoolbox"):
+            video = ["-c:v", "hevc_videotoolbox", "-q:v", vt265, "-g", GOP]
+        else:
+            video = ["-c:v", "libx265", "-preset", "medium", "-crf", x265]
+        # the hvc1 tag keeps the track playable in QuickTime / Finder / Safari
+        video += ["-tag:v", "hvc1"]
+    elif _has_encoder("h264_videotoolbox"):
+        video = ["-c:v", "h264_videotoolbox", "-q:v", vt264, "-g", GOP]
     else:
-        video = ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf,
-                 "-pix_fmt", "yuv420p"]
-    return video + ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
-
-
-_has_vt_hevc = None
+        video = ["-c:v", "libx264", "-preset", "veryfast", "-crf", x264]
+    return video + ["-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
 
 
 def hevc_args():
-    """Visually-lossless H.265 video encode (Apple hardware HEVC when present).
-    HEVC is ~40-50% more byte-efficient than H.264 at matched visual quality, so
-    it shrinks the file with no perceptible loss. Audio is copied, not re-encoded
-    (a second AAC pass would degrade it for no space win). The hvc1 tag keeps the
-    track playable in QuickTime / Finder / Safari."""
-    global _has_vt_hevc
-    if _has_vt_hevc is None:
-        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
-                             capture_output=True, text=True).stdout
-        _has_vt_hevc = "hevc_videotoolbox" in out
-    if _has_vt_hevc:
-        video = ["-c:v", "hevc_videotoolbox", "-q:v", "60", "-pix_fmt", "yuv420p"]
+    """H.265 re-encode of a finished file at the balanced tier (compress.py).
+    Audio is copied, not re-encoded — a second AAC pass would degrade it for
+    no space win."""
+    if _has_encoder("hevc_videotoolbox"):
+        video = ["-c:v", "hevc_videotoolbox", "-q:v", QUALITY["balanced"][2], "-g", GOP,
+                 "-pix_fmt", "yuv420p"]
     else:
         video = ["-c:v", "libx265", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p"]
     return video + ["-tag:v", "hvc1", "-c:a", "copy", "-movflags", "+faststart"]
 
 
-def compress_to_hevc(path):
-    """Re-encode `path` in place to visually-lossless H.265, but KEEP the result
-    only when it is actually smaller (screen recordings already compress very well
-    in H.264, so HEVC doesn't always win — never make the file bigger). Returns
-    (before_bytes, after_bytes) when it compressed, else None (file untouched)."""
-    path = Path(path)
-    before = path.stat().st_size
-    tmp = path.with_name(path.stem + ".hevc" + path.suffix)
-    try:
-        run_ffmpeg(["-i", str(path)] + hevc_args() + [str(tmp)])
-    except Exception as e:
-        if tmp.exists():
-            tmp.unlink()
-        print(f"compression skipped ({e})", flush=True)
-        return None
-    after = tmp.stat().st_size if tmp.exists() else before
-    if after and after < before * 0.97:      # only worth it if ≥3% smaller
-        tmp.replace(path)
-        return (before, after)
-    if tmp.exists():
-        tmp.unlink()
-    return None
-
-
 def write_rounded_mask_png(path, w, h, radius_pct):
     """Grayscale PNG rounded-rect alpha mask, stdlib only (no PIL).
     radius_pct matches the CSS border-radius % from the recorder UI:
-    50% on a square box = circle."""
+    50% on a square box = circle. The curved edge is anti-aliased (alpha =
+    how much of each pixel lies inside the curve) — a hard 0/255 cut-off
+    makes the webcam bubble's rounded corners visibly staircased."""
     r = max(0.0, min(50.0, float(radius_pct))) / 100.0 * min(w, h)
+    full = b"\x00" + b"\xff" * w                # filter byte + an all-opaque row
     rows = bytearray()
-    r2 = r * r
     for y in range(h):
-        rows.append(0)  # PNG filter type: None
+        py = y + 0.5                              # pixel centre
+        cy = r if py < r else (h - r if py > h - r else None)
+        if cy is None:
+            rows += full
+            continue
+        row = bytearray(b"\xff" * w)
+        dy = py - cy
         for x in range(w):
-            # distance to nearest corner circle centre, if in a corner region
-            cx = r if x < r else (w - 1 - r if x > w - 1 - r else None)
-            cy = r if y < r else (h - 1 - r if y > h - 1 - r else None)
-            if cx is not None and cy is not None:
-                dx, dy = x - cx, y - cy
-                rows.append(255 if dx * dx + dy * dy <= r2 else 0)
-            else:
-                rows.append(255)
+            px = x + 0.5
+            cx = r if px < r else (w - r if px > w - r else None)
+            if cx is None:
+                continue
+            cover = r + 0.5 - math.hypot(px - cx, dy)
+            row[x] = 255 if cover >= 1 else 0 if cover <= 0 else int(cover * 255 + 0.5)
+        rows += b"\x00" + row
 
     def chunk(tag, data):
         c = tag + data
@@ -224,6 +250,27 @@ def load_json(path, default=None):
     if not p.exists():
         return default
     return json.loads(p.read_text())
+
+
+def write_json(path, obj):
+    """Write JSON beside `path` and rename it into place: a reader (the server,
+    an open editor) never sees half a file, and a crash keeps the old one."""
+    p = Path(path)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(obj, indent=2))
+    os.replace(tmp, p)
+
+
+def update_json(path, key, value):
+    """Set one top-level key of a JSON file, keeping every other key as it is
+    on disk NOW rather than when this script started — the server edits
+    meta.json (titles, render names) while long jobs run. None removes it."""
+    data = load_json(path, {}) or {}
+    if value is None:
+        data.pop(key, None)
+    else:
+        data[key] = value
+    write_json(path, data)
 
 
 def migrate_edits(old, new):
@@ -306,6 +353,9 @@ def keep_segments(transcript):
     first = words[kept_idx[0]]
     a = max(0.0, first["start"] - pad)
     b = first["end"] + pad
+    # everything before the first kept word is removed — don't pad into it
+    if kept_idx[0] > 0:
+        a = max(a, words[kept_idx[0] - 1]["end"])
     prev_i = kept_idx[0]
     for i in kept_idx[1:]:
         w, prev = words[i], words[prev_i]
@@ -322,6 +372,9 @@ def keep_segments(transcript):
         else:
             b = w["end"] + pad
         prev_i = i
+    # ...and everything after the last kept word is removed too
+    if prev_i + 1 < len(words):
+        b = min(b, words[prev_i + 1]["start"])
     segs.append((a, b))
 
     # Manual time-range cuts from the editor timeline (e.g. trimming a

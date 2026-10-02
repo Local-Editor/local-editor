@@ -30,7 +30,6 @@ Usage:
     archive.py restore <session-dir> [--files a.mp4 b.webm] [--remote R]
 """
 import argparse
-import json
 import re
 import subprocess
 import sys
@@ -39,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import load_json
+from common import load_json, update_json
 
 DEFAULT_REMOTE = "gdrive:Local Editor Archive"
 
@@ -86,7 +85,9 @@ def archived_map(meta):
 
 
 def save_meta(d: Path, meta: dict):
-    (d / "meta.json").write_text(json.dumps(meta, indent=2))
+    """Persist the archive map only — the server may have renamed the session
+    or a render while the transfer ran, and those edits must survive."""
+    update_json(d / "meta.json", "archive", meta.get("archive"))
 
 
 def run_rclone(args, label):

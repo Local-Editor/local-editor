@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import migrate_edits
+from common import migrate_edits, write_json
 
 
 def main():
@@ -26,7 +26,7 @@ def main():
     cur_path = d / "transcript.json"
     cur = json.loads(cur_path.read_text())
     stats = migrate_edits(old, cur)
-    cur_path.write_text(json.dumps(cur, indent=2))
+    write_json(cur_path, cur)
     print(f"migrated from {args.src}: {stats['removed']} cut words, "
           f"{stats['keepGapAfter']} kept pauses, {stats['edited']} text edits")
 

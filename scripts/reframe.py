@@ -22,15 +22,22 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (ffprobe, video_stream, has_audio, duration_of, run_ffmpeg,
                     even, write_rounded_mask_png, load_json, encode_args,
-                    normalize_audio_timeline)
+                    normalize_audio_timeline, build_then_swap, exit_on_sigterm)
 from composite import mic_chain, mic_input
 
 CANVAS = {"short": (1080, 1920), "square": (1080, 1080)}
+# Lanczos, not swscale's default bicubic: shorts shrink the screen ~3x and
+# bicubic softens small UI text noticeably more.
+SCALE = ":flags=lanczos"
+# The camera is usually the FIRST input here (cam-top), and the output takes
+# its colour tags from it — Chrome's webcam tags only the matrix, so shorts
+# came out with unknown primaries/transfer. Say what they are.
+BT709 = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
 
 
 def fill(src_label, w, h, extra=""):
     """Scale-and-centre-crop a stream to exactly w x h."""
-    return (f"{src_label}scale={w}:{h}:force_original_aspect_ratio=increase,"
+    return (f"{src_label}scale={w}:{h}:force_original_aspect_ratio=increase{SCALE},"
             f"crop={w}:{h}{extra}")
 
 
@@ -77,8 +84,8 @@ def main():
         write_rounded_mask_png(mask, cam_w, cam_h, float(layout.get("radius", 18)))
         inputs += ["-loop", "1", "-i", str(mask)]
         graph = (
-            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30[scr];"
-            f"[1:v]scale={cam_w}:{cam_h}:force_original_aspect_ratio=increase,"
+            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase{SCALE},crop={W}:{H},fps=30[scr];"
+            f"[1:v]scale={cam_w}:{cam_h}:force_original_aspect_ratio=increase{SCALE},"
             f"crop={cam_w}:{cam_h}{mirror}[cam];"
             f"[2:v]format=gray[m];[cam][m]alphamerge[cama];"
             f"[scr][cama]overlay={W - cam_w - 40}:{H - cam_h - 40}:eof_action=pass[v]"
@@ -86,13 +93,15 @@ def main():
     else:
         half = even(H / 2)
         cam_first = args.layout == "cam-top"
-        cam_chain = (f"[1:v]scale={W}:{half}:force_original_aspect_ratio=increase,"
+        cam_chain = (f"[1:v]scale={W}:{half}:force_original_aspect_ratio=increase{SCALE},"
                      f"crop={W}:{half}{mirror}[camh]")
-        scr_chain = (f"[0:v]scale={W}:{half}:force_original_aspect_ratio=increase,"
+        scr_chain = (f"[0:v]scale={W}:{half}:force_original_aspect_ratio=increase{SCALE},"
                      f"crop={W}:{half}[scrh]")
         top, bottom = ("[camh]", "[scrh]") if cam_first else ("[scrh]", "[camh]")
         graph = (f"{cam_chain};{scr_chain};"
                  f"{top}{bottom}vstack=inputs=2:shortest=0,fps=30[v]")
+
+    graph = graph.replace("[v]", "[vraw]") + f";[vraw]{BT709}[v]"
 
     # audio — mic primary, mix system audio when present (same as composite.py)
     screen_audio = has_audio(ffprobe(screen))
@@ -113,10 +122,14 @@ def main():
     elif screen_audio:
         audio_map = ["-map", "0:a"]
 
-    run_ffmpeg(inputs + ["-filter_complex", graph, "-map", "[v]"] + audio_map
-               + ([] if audio_map else ["-an"])
-               + encode_args(args.quality) + [str(out)])
-    normalize_audio_timeline(out)
+    def build(tmp):
+        run_ffmpeg(inputs + ["-filter_complex", graph, "-map", "[v]"] + audio_map
+                   + ([] if audio_map else ["-an"])
+                   + encode_args(args.quality) + [str(tmp)])
+        normalize_audio_timeline(tmp)
+
+    exit_on_sigterm()
+    build_then_swap(out, build)
     print(f"reframed: {out} ({duration_of(out):.1f}s, {W}x{H}, {args.layout})")
     return out
 

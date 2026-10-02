@@ -17,6 +17,8 @@ let tr = null;            // transcript object
 let lastClicked = -1;     // for shift-click range cuts
 let pendingCutTimer = null; // click-to-cut deferred so dblclick can cancel it
 let dirty = false;
+let editVersion = 0;       // bumped by every edit (markDirty)
+let keepCache = null;      // keepSegmentsCached()
 
 const GAP_SHOW_SEC = 1.5; // show a chip for pauses at least this long
 
@@ -647,7 +649,9 @@ function healDuration() {
   if (!real) return false;
   let healed = false;
   if (!(tr.duration > 0) || tr.duration < lastWord) {
-    tr.duration = Math.round(real * 1000) / 1000;
+    // never shorter than the speech (same floor as transcribe.py), or this
+    // "heals" again on every call
+    tr.duration = Math.round(Math.max(real, lastWord) * 1000) / 1000;
     healed = true;
   }
   const sg = tr.segments;
@@ -711,18 +715,57 @@ function fmtSec(s) {
   return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 }
 
+// The transcript's spans, by word index. Edits only flip classes/text on
+// these (refreshTranscript); the full build runs when the words themselves
+// change (load, undo, re-transcribe). Rebuilding ~5k spans and their handlers
+// on every click-to-cut cost ~35ms a click on a long recording.
+let wordEls = [], chipEls = [], wordElsTr = null;
+let curWordEl = null, dragSelEls = [];
+
+const wordClass = (w, i, hits) => 'word' + (w.removed ? ' removed' : '') + (w.edited ? ' edited' : '')
+  + (w.detected ? ' detected' : '') + (hits.has(i) ? ' search-hit' : '');
+const chipText = (w, next) => {
+  const secs = (next.start - w.end).toFixed(1);
+  return w.keepGapAfter ? `⏸ ${secs}s kept` : `✂ ${secs}s pause`;
+};
+
+function refreshTranscript() {
+  const hits = searchHitSet();
+  tr.words.forEach((w, i) => {
+    const span = wordEls[i];
+    let cls = wordClass(w, i, hits);
+    if (span === curWordEl) cls += ' current';
+    if (span.classList.contains('drag-sel')) cls += ' drag-sel';
+    if (span.className !== cls) span.className = cls;
+    const txt = w.w + ' ';
+    if (span.textContent !== txt) span.textContent = txt;
+    const reason = w.removed && w.reason ? w.reason : null;
+    if ((span.dataset.reason || null) !== reason) {
+      if (reason) span.dataset.reason = reason; else delete span.dataset.reason;
+    }
+    const chip = chipEls[i];
+    if (chip) {
+      const cc = 'gap-chip' + (w.keepGapAfter ? ' kept' : '');
+      if (chip.className !== cc) { chip.className = cc; chip.textContent = chipText(w, tr.words[i + 1]); }
+    }
+  });
+}
+
 function renderTranscript() {
+  if (wordElsTr === tr && wordEls.length === tr.words.length) return refreshTranscript();
   const el = $('transcript');
   el.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  wordEls = []; chipEls = []; wordElsTr = tr; curWordEl = null; dragSelEls = [];
   const hits = searchHitSet();
   tr.words.forEach((w, i) => {
     const span = document.createElement('span');
-    span.className = 'word' + (w.removed ? ' removed' : '') + (w.edited ? ' edited' : '')
-      + (w.detected ? ' detected' : '') + (hits.has(i) ? ' search-hit' : '');
+    span.className = wordClass(w, i, hits);
     if (w.detected) span.title = 'Sound Whisper couldn\'t transcribe (likely an um/breath) — click twice to cut or restore';
     span.textContent = w.w + ' ';
     span.dataset.i = i;
     if (w.removed && w.reason) span.dataset.reason = w.reason;
+    wordEls[i] = span;
 
     span.addEventListener('pointerdown', () => { dragAnchor = i; dragLast = i; });
     span.addEventListener('pointerenter', () => {
@@ -758,20 +801,21 @@ function renderTranscript() {
       if (edited !== null && edited !== w.w) { w.w = edited; w.edited = true; markDirty(); renderTranscript(); }
     };
 
-    el.appendChild(span);
+    frag.appendChild(span);
 
     // pause chip between this word and the next
     const next = tr.words[i + 1];
     if (next && next.start - w.end >= GAP_SHOW_SEC) {
       const chip = document.createElement('span');
-      const secs = (next.start - w.end).toFixed(1);
       chip.className = 'gap-chip' + (w.keepGapAfter ? ' kept' : '');
-      chip.textContent = w.keepGapAfter ? `⏸ ${secs}s kept` : `✂ ${secs}s pause`;
+      chip.textContent = chipText(w, next);
       chip.title = 'Click to toggle keeping this pause in the final video';
       chip.onclick = () => { w.keepGapAfter = !w.keepGapAfter; markDirty(); renderTranscript(); updateStats(); };
-      el.appendChild(chip);
+      chipEls[i] = chip;
+      frag.appendChild(chip);
     }
   });
+  el.appendChild(frag);
 }
 
 // ---------- word search & bulk cut ----------
@@ -807,7 +851,7 @@ $('searchBox').addEventListener('keydown', e => {
   searchCursor = (searchCursor + 1) % searchHits.length;
   const first = tr.words[searchHits[searchCursor][0]];
   $('player').currentTime = Math.max(0, first.start - 0.05);
-  const el = document.querySelector(`.word[data-i="${searchHits[searchCursor][0]}"]`);
+  const el = wordEls[searchHits[searchCursor][0]];
   if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
   $('searchCount').textContent = `${searchCursor + 1} / ${searchHits.length}`;
 });
@@ -831,9 +875,11 @@ function searchHitSet() {
 }
 
 function highlight(idx) {
-  document.querySelectorAll('.word.current').forEach(e => e.classList.remove('current'));
-  const el = document.querySelector(`.word[data-i="${idx}"]`);
+  const el = wordEls[idx] || null;
+  if (el === curWordEl) return;
+  if (curWordEl) curWordEl.classList.remove('current');
   if (el) el.classList.add('current');
+  curWordEl = el;
 }
 
 // follow playback + skip removed regions
@@ -843,26 +889,20 @@ $('player').addEventListener('timeupdate', () => {
   const idx = tr.words.findIndex(w => t >= w.start && t <= w.end + 0.15);
   if (idx >= 0) highlight(idx);
 
-  if ($('skipRemoved').checked && !$('player').paused) {
-    const seg = keepSegments();
-    const inKeep = seg.some(([a, b]) => t >= a - 0.05 && t <= b + 0.05);
-    if (!inKeep) {
-      const nxt = seg.find(([a]) => a > t);
-      if (nxt) $('player').currentTime = nxt[0];
-    }
-  }
 });
 
 // ---------- cut model (mirrors scripts/render.py) ----------
 function keepSegments() {
   // A removed word ALWAYS forces a cut (pad clamped so the removed audio
   // can't leak back in); silences > maxGap collapse unless keepGapAfter.
-  const pad = tr.settings.padSec, maxGap = tr.settings.maxGapSec;
+  const pad = tr.settings.padSec ?? 0.12, maxGap = tr.settings.maxGapSec ?? 1.0;
   const keptIdx = tr.words.map((w, i) => w.removed ? -1 : i).filter(i => i >= 0);
   if (!keptIdx.length) return [];
   const segs = [];
   const first = tr.words[keptIdx[0]];
   let a = Math.max(0, first.start - pad), b = first.end + pad;
+  // everything before the first kept word is removed — don't pad into it
+  if (keptIdx[0] > 0) a = Math.max(a, tr.words[keptIdx[0] - 1].end);
   let prevI = keptIdx[0];
   for (const i of keptIdx.slice(1)) {
     const w = tr.words[i], prev = tr.words[prevI];
@@ -881,6 +921,8 @@ function keepSegments() {
     }
     prevI = i;
   }
+  // ...and everything after the last kept word is removed too
+  if (prevI + 1 < tr.words.length) b = Math.min(b, tr.words[prevI + 1].start);
   segs.push([a, b]);
   // subtract manual timeline range-cuts (mirrors common.py)
   let out = segs;
@@ -896,6 +938,13 @@ function keepSegments() {
   return out.filter(([s, e]) => e - s > 0.02);
 }
 
+// keepSegments() is O(words); the per-frame playback check reads this copy.
+// Every edit goes through markDirty() (which drops it) or replaces `tr`.
+function keepSegmentsCached() {
+  if (!keepCache || keepCache.tr !== tr) keepCache = { tr, segs: keepSegments() };
+  return keepCache.segs;
+}
+
 function updateStats() {
   const dur = tr.duration || $('player').duration || 0;
   const keep = keepSegments().reduce((s, [a, b]) => s + (b - a), 0);
@@ -908,7 +957,11 @@ function updateStats() {
 }
 
 // ---------- actions ----------
-function markDirty() { dirty = true; $('saveBtn').textContent = 'Save transcript *'; histPush(); }
+function markDirty() {
+  dirty = true; editVersion++; keepCache = null;
+  $('saveBtn').textContent = 'Save transcript *';
+  histPush();
+}
 
 // ---------- undo / redo (⌘Z / ⇧⌘Z) ----------
 // Every committed edit calls markDirty() after mutating `tr`, so the history
@@ -951,7 +1004,24 @@ async function histGo(dir) {
 }
 
 $('saveBtn').onclick = saveTranscript;
-async function saveTranscript() {
+// Saves run one at a time: several call sites fire without awaiting, and two
+// overlapping POSTs raced each other to disk. A save requested while one is
+// in flight is folded into a single follow-up that sends the latest state.
+let saving = null, saveAgain = false;
+function saveTranscript() {
+  if (saving) { saveAgain = true; return saving; }
+  saving = (async () => {
+    try {
+      do { saveAgain = false; await saveOnce(); } while (saveAgain);
+    } finally {
+      saving = null;
+    }
+  })();
+  return saving;
+}
+
+async function saveOnce() {
+  const ver = editVersion;
   const res = await fetch(`/api/transcript?session=${sessionId}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(tr, null, 2),
@@ -968,19 +1038,33 @@ async function saveTranscript() {
       if (hit && !w.removed) { w.removed = true; w.reason = hit[2] || 'manual'; carried++; }
     }
     for (const t of tr.words.filter(w => w.keepGapAfter).map(w => w.end)) {
+      if (!fresh.words.length) break;
       const cand = fresh.words.reduce((best, w) => Math.abs(w.end - t) < Math.abs(best.end - t) ? w : best);
       if (Math.abs(cand.end - t) < 0.5) cand.keepGapAfter = true;
+    }
+    // the timeline didn't move, only the words were re-transcribed — so this
+    // tab's arrangement (the edit that triggered this save) is still valid
+    for (const k of ['segments', 'inserts', 'tracks', 'cutRanges', 'settings', 'subtitleStyle']) {
+      if (tr[k] !== undefined) fresh[k] = tr[k];
     }
     tr = fresh;
     tr.settings = tr.settings || { padSec: 0.12, maxGapSec: 1.0 };
     histReset();   // old snapshots carry the old generatedAt — saving them would 409
     renderTranscript(); updateStats();
-    await saveTranscript();
+    await saveOnce();
     alert(`The transcript was re-generated with a better model while you were editing.\nYour cuts (${carried} words) were carried over onto the new transcript automatically.`);
     return;
   }
-  dirty = false;
-  $('saveBtn').textContent = 'Save transcript';
+  if (!res.ok) {
+    // stay "unsaved" so the leave-page warning still protects the edit
+    console.error('[editor] save failed', res.status, await res.text().catch(() => ''));
+    $('saveBtn').textContent = 'Save transcript * (last save failed — click to retry)';
+    return;
+  }
+  if (editVersion === ver) {             // an edit made mid-save is still unsaved
+    dirty = false;
+    $('saveBtn').textContent = 'Save transcript';
+  }
 }
 
 $('aiCleanBtn').onclick = async () => {
@@ -1602,12 +1686,11 @@ async function pollJob(name) {
     $('jobLog').textContent = tail;
     $('jobLog').scrollTop = $('jobLog').scrollHeight;
     if (j.status === 'running') {
-      // renders are multi-pass (composite/reframe -> cut -> mix); name the
-      // pass so a restarting bar reads as progress, not a stuck render
+      // a render may first build the composite/reframe, then draw captions,
+      // then encode; name the pass so a restarting bar reads as progress
       const STAGES = { composite: 'building the full composite', reframe: 'reframing',
-                       cut: 'cutting the edit', mix: 'mixing music & overlays',
-                       captions: 'drawing captions',
-                       denoise: 'removing background noise', compress: 'compressing to save space',
+                       captions: 'drawing captions', render: 'cutting, mixing & encoding',
+                       compress: 'compressing to save space',
                        proxy: 'building smooth preview' };
       const stage = STAGES[j.stage] ? ` — ${STAGES[j.stage]}` : '';
       const pct = jobPercent(name, tail);
@@ -1730,6 +1813,7 @@ function normalizeTimeline() {
 }
 
 function tlSetup() {
+  if (tl.resize) { tl.resize(); return; }   // listeners attach once; a re-run re-measures
   $('timelineBar').classList.remove('hidden');
   const c = $('timeline');
   const resize = () => {
@@ -1930,7 +2014,8 @@ function tlSetup() {
           tlToast('🔁 loop off — trimming sets a manual length');
         }
         tl.trimDrag = { kind: 'ins', ins: hit.ins, edge: hit.edge, x0: e.clientX, moved: false,
-                        at0: hit.ins.at, dur0: hit.ins.duration || 0, src0: hit.ins.srcStart || 0 };
+                        at0: hit.ins.at, dur0: hit.ins.duration || 0, src0: hit.ins.srcStart || 0,
+                        cuts0: (hit.ins.cuts || []).map(c => c.slice()) };
       } else if (e.shiftKey) {
         // ⇧-drag = cut-select, wherever you are: select this timeline and start the band
         if (tl.selectedLane !== lane) { tl.selectedLane = lane; tl.expandedLane = lane; tl.resize(); }
@@ -1997,6 +2082,13 @@ function tlSetup() {
             ins.at = Math.round(start * 100) / 100;
             ins.srcStart = Math.max(0, Math.round((d.src0 + delta) * 100) / 100);
             ins.duration = Math.max(0.2, Math.round((rightFixed - start) * 100) / 100);
+            // cuts are measured from srcStart — shift them with it, or they
+            // land on different material (in the preview AND the render)
+            if (d.cuts0.length) {
+              const shift = ins.srcStart - d.src0;
+              ins.cuts = d.cuts0.map(([a, b]) => [Math.max(0, a - shift), b - shift])
+                .filter(([a, b]) => b - a > 0.01);
+            }
           }
         } else {
           const sg = d.sg;
@@ -2811,6 +2903,7 @@ function tlRedrawStatic() {
   const off = tl.static = (tl.static && tl.static.width === c.width && tl.static.height === c.height)
     ? tl.static
     : Object.assign(document.createElement('canvas'), { width: c.width, height: c.height });
+  tl.staticGen = (tl.staticGen || 0) + 1;   // tlFrame repaints when this changes
   const g = off.getContext('2d');
   const W = off.width, H = off.height;
   const v = tlView();
@@ -2967,6 +3060,12 @@ function tlFrame() {
   }
   const v = tlView();
   const x = tt => (tt - v.start) / v.len * W;
+  // Nothing moved since the last paint? Skip it. Repainting every frame while
+  // paused kept the browser re-compositing the blurred (backdrop-filter) dock.
+  const sig = `${W}x${H}|${t.toFixed(3)}|${v.start}|${v.len}|${tl.sel}|${tl.snapAt}`
+    + `|${tl.selectedLane}|${!!activeOverlay}|${tl.staticGen}`;
+  if (sig === tl.lastSig) return;
+  tl.lastSig = sig;
   g.clearRect(0, 0, W, H);
   if (tl.static) g.drawImage(tl.static, 0, 0);
   // drag selection — only over the selected timeline's row
@@ -3002,17 +3101,19 @@ function tlFrame() {
 let dragAnchor = null, dragLast = null, dragJustCut = false;
 
 function applyDragSel() {
-  document.querySelectorAll('.word.drag-sel').forEach(e => e.classList.remove('drag-sel'));
   let a, b;
   if (dragAnchor !== null && dragLast !== null && dragAnchor !== dragLast) {
     [a, b] = [Math.min(dragAnchor, dragLast), Math.max(dragAnchor, dragLast)];
   } else if (typeof txSel !== 'undefined' && txSel) {
     [a, b] = txSel;
-  } else return;
-  for (let k = a; k <= b; k++) {
-    const el = document.querySelector(`.word[data-i="${k}"]`);
-    if (el) el.classList.add('drag-sel');
   }
+  // wordEls, not a document query per word: that walked the whole transcript
+  // for every word in the range, ~12ms per word dragged over near the end
+  const want = a === undefined ? [] : wordEls.slice(a, b + 1);
+  const keep = new Set(want);
+  for (const el of dragSelEls) if (!keep.has(el)) el.classList.remove('drag-sel');
+  for (const el of want) el.classList.add('drag-sel');
+  dragSelEls = want;
 }
 
 let txSel = null; // [firstWordIdx, lastWordIdx] — persistent transcript selection
@@ -3102,6 +3203,7 @@ $('copyTranscriptBtn').onclick = async () => {
 // playhead keeps moving through empty timeline.
 let activeOverlay = null;
 let gap = null;          // {tlPos0, started, untilTl, next}
+let curSegId = null;     // the footage piece playback is in (see checkArrangement)
 let lastMainT = 0;
 
 function insertUrl(ins) {
@@ -3129,6 +3231,8 @@ function seekTimeline(c) {
   $('gapCover').classList.add('hidden');
   const loc = locate(c);
   if (loc.type === 'base') {
+    const sg = segs().find(x => c >= x.pos && c < x.pos + segLen(x));
+    curSegId = sg ? sg.id : null;
     $('player').currentTime = loc.t;
   } else {
     $('player').pause();
@@ -3173,6 +3277,11 @@ function overlaySync() {
       ip.removeAttribute('src');
       $('insertBadge').classList.add('hidden');
     }
+  } else if (top && top !== activeOverlay) {
+    // same clip, new object (undo, reload): edits must land on THIS one —
+    // the old object is no longer in `tr`, so changes to it never saved
+    activeOverlay = top;
+    placeInsertFrame(top);
   }
   if (top) {
     ip.style.zIndex = 6 + N;               // set AFTER placeInsertFrame (cssText wipes it)
@@ -3200,8 +3309,9 @@ function overlaySync() {
       el.addEventListener('loadedmetadata', () => { if (el._ov) placeInsertFrame(el._ov, el); });
       el.addEventListener('timeupdate', () => {
         if (!el._ov || el.paused) return;
-        const t = el.currentTime;
-        for (const [a, b] of insCuts(el._ov)) if (t >= a - 0.05 && t < b) { el.currentTime = b; return; }
+        const s0 = el._ov.srcStart || 0;
+        const t = el.currentTime - s0;
+        for (const [a, b] of insCuts(el._ov)) if (t >= a - 0.05 && t < b) { el.currentTime = s0 + b; return; }
       });
       $('playerStage').appendChild(el);
       subOverlays.set(ov.id, el);
@@ -3255,21 +3365,31 @@ function checkArrangement() {
       const nxt = gap.next;
       gap = null;
       $('gapCover').classList.add('hidden');
-      if (nxt) { p.currentTime = nxt.s0 + 0.001; p.play().catch(() => {}); }
+      if (nxt) { curSegId = nxt.id; p.currentTime = nxt.s0 + 0.001; p.play().catch(() => {}); }
       else p.pause();
     }
     return;
   }
   if (p.paused) return;
   const t = p.currentTime;
-  const sg = segs().find(x => t >= x.s0 - 0.05 && t <= x.s1 + 0.08);
+  // Which piece is playing? Source time alone is ambiguous at a seam: just
+  // after jumping into the next piece, t is still within the PREVIOUS piece's
+  // tolerance, and matching that one first re-jumped forever (playback froze
+  // at every plain scissor split). Prefer the piece we know we're in, then one
+  // that strictly contains t, and only then the tolerant match.
+  const all = segs();
+  const near = x => t >= x.s0 - 0.05 && t <= x.s1 + 0.08;
+  const sg = all.find(x => x.id === curSegId && near(x))
+    || all.find(x => t >= x.s0 && t < x.s1) || all.find(near);
   if (!sg) return;
+  curSegId = sg.id;
   if (t >= sg.s1 - 0.05) {
     const c = sg.pos + segLen(sg);
-    const nxt = segs().filter(x => x.id !== sg.id && x.pos >= c - 0.05)
+    const nxt = all.filter(x => x.id !== sg.id && x.pos >= c - 0.05)
       .sort((a, b) => a.pos - b.pos)[0] || null;
     if (nxt && nxt.pos <= c + 0.05) {
-      p.currentTime = nxt.s0 + 0.001;                 // adjacent piece: jump straight in
+      curSegId = nxt.id;                              // adjacent piece: jump straight in —
+      if (Math.abs(nxt.s0 - sg.s1) > 0.01) p.currentTime = nxt.s0 + 0.001;  // or just play on
     } else if (nxt || overlayAt(c + 0.1)) {
       p.pause();                                       // gap: run the virtual clock
       gap = { tlPos0: c, started: performance.now(),
@@ -3278,6 +3398,18 @@ function checkArrangement() {
     } else {
       p.pause();                                       // true end of arrangement
     }
+    return;
+  }
+  // skip removed material — checked every frame (timeupdate fires only every
+  // ~250ms, which let a quarter-second of a cut "um" through), and only
+  // within this piece: the next kept span in SOURCE order can belong to a
+  // different piece entirely once pieces are reordered
+  if ($('skipRemoved').checked) {
+    const keeps = keepSegmentsCached();
+    if (!keeps.some(([a, b]) => t >= a - 0.05 && t <= b + 0.05)) {
+      const k = keeps.find(([a]) => a > t && a < sg.s1 - 0.05);
+      p.currentTime = k ? k[0] : sg.s1 - 0.04;      // nothing left here: hand off
+    }
   }
 }
 
@@ -3285,9 +3417,10 @@ function checkArrangement() {
 $('insertPlayer').addEventListener('timeupdate', () => {
   const ip = $('insertPlayer');
   if (!activeOverlay || ip.paused) return;
-  const t = ip.currentTime;
+  const s0 = activeOverlay.srcStart || 0;   // cuts are measured from the in-point
+  const t = ip.currentTime - s0;
   for (const [a, b] of insCuts(activeOverlay)) {
-    if (t >= a - 0.05 && t < b) { ip.currentTime = b; return; }
+    if (t >= a - 0.05 && t < b) { ip.currentTime = s0 + b; return; }
   }
 });
 

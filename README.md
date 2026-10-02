@@ -106,6 +106,11 @@ Left = video preview + controls. Right = the **transcript**. Bottom = the
 - Format: Original 16:9, or **9:16 / 1:1 Shorts** (webcam-top, screen-top,
   bubble-overlay). Live preview updates when you pick a format.
 - Quality: High / Balanced / Small. Uses the Mac's hardware encoder (fast).
+  The whole edit — cuts, pieces, gaps, overlays, music, captions — renders in
+  **one pass**, so every frame is encoded exactly once: no quality lost to
+  intermediate files, and a render with overlays or captions takes about as
+  long as one without. "Compress to save space" encodes H.265 in that same
+  pass (~30% smaller).
 - 💬 **Subtitles in one click**: "Add subtitles" reads the transcript and drops
   a caption clip onto a Subtitles timeline for every phrase you kept. Drag,
   trim, duplicate or right-click one to retype it, like any clip. Three looks

@@ -16,7 +16,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (ffprobe, video_stream, has_audio, duration_of,
                     run_ffmpeg, even, write_rounded_mask_png, load_json,
-                    encode_args, normalize_audio_timeline)
+                    encode_args, normalize_audio_timeline, build_then_swap,
+                    exit_on_sigterm)
 
 
 # Rewrite audio timestamps so they follow the SAMPLES, one after another.
@@ -58,11 +59,11 @@ def mic_input(webcam, n_inputs):
     return n_inputs, ["-i", str(webcam)]
 
 
-def main(session_dir):
-    d = Path(session_dir)
+def build(d, out):
+    """Composite session `d` into `out`. Returns the per-piece bubble placement
+    signature for the .composite-layouts.json sidecar (None: no bubble)."""
     screen = d / "screen.webm"
     webcam = d / "webcam.webm"
-    out = d / "composite.mp4"
     layout = load_json(d / "layout.json", {})
     meta = load_json(d / "meta.json", {})
 
@@ -72,12 +73,15 @@ def main(session_dir):
             w_info = ffprobe(webcam)
             wv = video_stream(w_info)
             ww, wh = even(int(wv["width"])), even(int(wv["height"]))
-            args = ["-i", str(webcam), "-vf", f"scale={ww}:{wh},fps=30"]
+            # Chrome tags only the webcam's matrix — label primaries and
+            # transfer too, or players guess (QuickTime shifts the colours)
+            args = ["-i", str(webcam), "-vf", f"scale={ww}:{wh},fps=30,setparams=color_primaries=bt709"
+                    ":color_trc=bt709:colorspace=bt709:range=tv"]
             if not has_audio(w_info):
                 args += ["-an"]
             run_ffmpeg(args + encode_args() + [str(out)])
             normalize_audio_timeline(out)
-            print(f"composite done (webcam only): {out}")
+            print("composite done (webcam only)")
             return
         sys.exit("no screen.webm or webcam.webm in session")
 
@@ -93,7 +97,7 @@ def main(session_dir):
             args += ["-an"]
         run_ffmpeg(args + encode_args() + [str(out)])
         normalize_audio_timeline(out)
-        print(f"composite done (screen only): {out}")
+        print("composite done (screen only)")
         return
 
     w_info = ffprobe(webcam)
@@ -120,7 +124,7 @@ def main(session_dir):
                     "-filter_complex", graph, "-map", "[v]"] + audio_map
                    + ([] if audio_map else ["-an"]) + encode_args() + [str(out)])
         normalize_audio_timeline(out)
-        print(f"composite done (screen + mic): {out} ({duration_of(out):.1f}s)")
+        print(f"composite done (screen + mic): {duration_of(out):.1f}s")
         return
 
     # Overlay geometry in screen pixels, matching the recorder preview.
@@ -178,7 +182,7 @@ def main(session_dir):
         mask_inputs += ["-loop", "1", "-i", str(mask_i)]
         midx = 2 + i
         parts.append(
-            f"[c{i}]scale={cw}:{ch}:force_original_aspect_ratio=increase,"
+            f"[c{i}]scale={cw}:{ch}:force_original_aspect_ratio=increase:flags=lanczos,"
             f"crop={cw}:{ch}" + (",hflip" if mirror else "") + f"[k{i}]")
         parts.append(f"[{midx}:v]format=gray[m{i}]")
         parts.append(f"[k{i}][m{i}]alphamerge[ka{i}]")
@@ -213,11 +217,20 @@ def main(session_dir):
             "-map", "[v]"] + audio_map + (["-an"] if not audio_map else [])
     run_ffmpeg(args + encode_args() + [str(out)])
     normalize_audio_timeline(out)
-    # sidecar so render.py knows which bubble placements this composite used
-    sig = [[round(float(sg["s0"]), 2), round(float(sg["s1"]), 2), sg["cam"]]
-           for sg in cam_segs]
-    (d / ".composite-layouts.json").write_text(json.dumps(sig, sort_keys=True))
-    print(f"composite done: {out} ({duration_of(out):.1f}s, {len(intervals)} bubble position(s))")
+    print(f"composite done: {duration_of(out):.1f}s, {len(intervals)} bubble position(s)")
+    # the sidecar tells render.py which bubble placements this composite used
+    return [[round(float(sg["s0"]), 2), round(float(sg["s1"]), 2), sg["cam"]]
+            for sg in cam_segs]
+
+
+def main(session_dir):
+    d = Path(session_dir)
+    exit_on_sigterm()
+    sig = build_then_swap(d / "composite.mp4", lambda tmp: build(d, tmp))
+    if sig is not None:
+        # written only once the new composite is in place, so it never vouches
+        # for a file that a cancelled build left behind
+        (d / ".composite-layouts.json").write_text(json.dumps(sig, sort_keys=True))
 
 
 if __name__ == "__main__":

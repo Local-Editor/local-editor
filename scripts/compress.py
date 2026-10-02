@@ -15,16 +15,17 @@ file is never compressed twice. Shared assets, masks and sidecars are skipped.
 Usage: compress.py <session-dir>
 """
 import sys
-import json
 import subprocess
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import duration_of, ffprobe, video_stream, hevc_args, load_json
+from common import (duration_of, ffprobe, video_stream, hevc_args, load_json,
+                    stream_has_alpha, update_json)
 
 
 def _save_meta(d, meta):
-    (d / "meta.json").write_text(json.dumps(meta, indent=2))
+    # only our key: titles/render names edited while this ran must survive
+    update_json(d / "meta.json", "compressed", meta.get("compressed"))
 
 
 def _webm_args(src, dst):
@@ -87,14 +88,21 @@ def main():
         if not f.is_file():
             continue
         n = f.name
-        # already handled, shared library assets, masks, sidecars — leave alone
-        if n in done or n.startswith("asset-") or n.startswith("mask-") or n.startswith("."):
+        # already handled, shared library assets, masks, sidecars — leave alone.
+        # Previews and reframes are disposable caches (rebuilt on demand), and
+        # a ".cmp."/".tmp." name is a half-finished pass from a cancelled run.
+        if (n in done or n.startswith(("asset-", "mask-", "proxy-", "reframe-", "."))
+                or ".cmp." in n or ".tmp." in n):
             continue
         ext = f.suffix.lower()
-        if ext == ".webm":
-            targets.append((f, "webm"))
-        elif ext in (".mp4", ".mov"):
-            targets.append((f, "mp4"))
+        if ext not in (".webm", ".mp4", ".mov"):
+            continue
+        # transparent clips (ProRes 4444 / VP9-alpha mascot inserts): both
+        # re-encodes here are yuv420p, which would flatten them to opaque boxes
+        if stream_has_alpha(video_stream(ffprobe(f))):
+            print(f"{n}: has transparency — left as-is", flush=True)
+            continue
+        targets.append((f, "webm" if ext == ".webm" else "mp4"))
 
     total = len(targets)
     print(f"compressing {total} file(s)", flush=True)

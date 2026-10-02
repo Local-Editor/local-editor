@@ -12,6 +12,7 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const { spawn } = require('child_process');
+const { pipeline } = require('stream');
 
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
@@ -256,9 +257,43 @@ function safeSession(id) {
 function sessionDir(id) { return path.join(RECORDINGS, safeSession(id)); }
 
 function json(res, code, obj) {
+  if (res.headersSent) return res.destroy();
   const body = JSON.stringify(obj, null, 2);
   res.writeHead(code, { 'Content-Type': 'application/json' });
   res.end(body);
+}
+
+// One writer at a time per file, and every write lands by rename. Two
+// overlapping plain writeFile calls interleave their chunks into invalid JSON
+// (a 1MB transcript is written in 512KB pieces), and a reader that arrives
+// mid-write sees half a file. Read-modify-write callers run the whole cycle
+// inside the lock so a concurrent save can't slip in between.
+const fileLocks = new Map();
+function withFileLock(file, fn) {
+  const run = (fileLocks.get(file) || Promise.resolve()).then(fn);
+  const settled = run.then(() => {}, () => {});
+  fileLocks.set(file, settled);
+  settled.then(() => { if (fileLocks.get(file) === settled) fileLocks.delete(file); });
+  return run;
+}
+
+async function writeAtomic(file, data) {
+  const tmp = `${file}.${process.pid}-${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    await fsp.writeFile(tmp, data);
+    await fsp.rename(tmp, file);
+  } catch (err) {
+    await fsp.unlink(tmp).catch(() => {});
+    throw err;
+  }
+}
+
+// Stream a file to the response. pipeline() — not .pipe() — so a client that
+// aborts mid-transfer (every <video> seek does) also closes the file; .pipe()
+// left one descriptor open per aborted request, and those held deleted media
+// on disk until the server restarted.
+function sendFile(res, filePath, opts) {
+  pipeline(fs.createReadStream(filePath, opts), res, () => {});
 }
 
 function readBody(req) {
@@ -287,6 +322,8 @@ function runJob(sessionId, name, cmd, args, onDone) {
     job.log += s;
     if (job.log.length > 200000) job.log = job.log.slice(-150000);
   };
+  child.stdout.setEncoding('utf8');      // "»" is 2 bytes and can straddle chunks
+  child.stderr.setEncoding('utf8');
   child.stdout.on('data', capture);
   child.stderr.on('data', capture);
   child.on('close', code => {
@@ -362,8 +399,9 @@ function serveStatic(res, filePath, range) {
     if (range) {
       const m = /bytes=(\d*)-(\d*)/.exec(range);
       if (m && (m[1] || m[2])) {
-        const start = m[1] ? parseInt(m[1], 10) : 0;
-        const end = Math.min(m[2] ? parseInt(m[2], 10) : stat.size - 1, stat.size - 1);
+        const suffix = !m[1];                       // "bytes=-N": the last N bytes
+        const start = suffix ? Math.max(0, stat.size - parseInt(m[2], 10)) : parseInt(m[1], 10);
+        const end = suffix || !m[2] ? stat.size - 1 : Math.min(parseInt(m[2], 10), stat.size - 1);
         if (start > end || start >= stat.size) {
           res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
           return res.end();
@@ -374,19 +412,39 @@ function serveStatic(res, filePath, range) {
           'Accept-Ranges': 'bytes',
           'Content-Length': end - start + 1,
         });
-        fs.createReadStream(filePath, { start, end })
-          .on('error', () => res.destroy()).pipe(res);
-        return;
+        return sendFile(res, filePath, { start, end });
       }
     }
     res.writeHead(200, { 'Content-Type': type, 'Content-Length': stat.size, 'Accept-Ranges': 'bytes' });
-    fs.createReadStream(filePath).on('error', () => res.destroy()).pipe(res);
+    sendFile(res, filePath);
   });
 }
 
+// DNS-rebinding and cross-site guard. Bound to loopback, the only legitimate
+// Host is this machine's own name; any other means a hostile page resolved its
+// domain to 127.0.0.1 and is calling the API with full access. And a browser
+// sends Origin on every POST/DELETE — one from another site is refused, so a
+// page you happen to have open can't start jobs or overwrite recordings.
+const LOOPBACK = ['127.0.0.1', 'localhost', '::1'].includes(HOST);
+const LOCAL_HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`, `[::1]:${PORT}`]);
+function allowedRequest(req) {
+  const host = (req.headers.host || '').toLowerCase();
+  if (LOOPBACK && !LOCAL_HOSTS.has(host)) return false;
+  const origin = req.headers.origin;
+  if (origin && req.method !== 'GET' && req.method !== 'HEAD') {
+    try { return new URL(origin).host.toLowerCase() === host; } catch { return false; }
+  }
+  return true;
+}
+
+process.on('unhandledRejection', err => console.error('[unhandled]', err && err.stack || err));
+
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
+  let url;
+  try { url = new URL(req.url, `http://localhost:${PORT}`); }
+  catch { res.writeHead(400); return res.end('bad request'); }
   const p = url.pathname;
+  if (!allowedRequest(req)) { res.writeHead(403); return res.end('forbidden'); }
   try {
     // ---------- API ----------
     if (p === '/api/sessions' && req.method === 'GET') {
@@ -399,10 +457,20 @@ const server = http.createServer(async (req, res) => {
       if (!safeName(name)) return json(res, 400, { error: 'bad file name' });
       const dir = sessionDir(id);
       await fsp.mkdir(dir, { recursive: true });
-      const file = fs.createWriteStream(path.join(dir, name));
-      req.pipe(file);
-      file.on('finish', () => json(res, 200, { ok: true, saved: `${id}/${name}` }));
-      file.on('error', err => json(res, 500, { error: err.message }));
+      // an aborted upload must not leave a truncated screen.webm under its
+      // real name — write beside it and rename once the body is complete
+      const dest = path.join(dir, name);
+      const part = `${dest}.part`;
+      pipeline(req, fs.createWriteStream(part), async err => {
+        try {
+          if (err) throw err;
+          await fsp.rename(part, dest);
+          json(res, 200, { ok: true, saved: `${id}/${name}` });
+        } catch (e) {
+          await fsp.unlink(part).catch(() => {});
+          json(res, 500, { error: e.message });
+        }
+      });
       return;
     }
 
@@ -434,7 +502,7 @@ const server = http.createServer(async (req, res) => {
       const file = path.join(sessionDir(id), 'transcript.json');
       if (!fs.existsSync(file)) return json(res, 404, { error: 'no transcript yet' });
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      return fs.createReadStream(file).pipe(res);
+      return sendFile(res, file);
     }
 
     if (p === '/api/transcript' && req.method === 'POST') {
@@ -444,15 +512,16 @@ const server = http.createServer(async (req, res) => {
       // Stale-tab guard: if the transcript was regenerated since this editor
       // tab loaded it, refuse the save instead of clobbering the new version.
       const file = path.join(sessionDir(id), 'transcript.json');
-      if (fs.existsSync(file)) {
-        try {
-          const disk = JSON.parse(await fsp.readFile(file, 'utf8'));
-          if (disk.generatedAt && incoming.generatedAt !== disk.generatedAt) {
-            return json(res, 409, { error: 'transcript was regenerated — reload the editor to get the new version (your cuts were migrated into it)' });
-          }
-        } catch {}
+      const stale = await withFileLock(file, async () => {
+        let disk = null;
+        try { disk = JSON.parse(await fsp.readFile(file, 'utf8')); } catch {}
+        if (disk && disk.generatedAt && incoming.generatedAt !== disk.generatedAt) return true;
+        await writeAtomic(file, body);
+        return false;
+      });
+      if (stale) {
+        return json(res, 409, { error: 'transcript was regenerated — reload the editor to get the new version (your cuts were migrated into it)' });
       }
-      await fsp.writeFile(file, body);
       return json(res, 200, { ok: true });
     }
 
@@ -502,28 +571,34 @@ const server = http.createServer(async (req, res) => {
       const at = parseFloat(url.searchParams.get('at') || '0') || 0;
       const duration = parseFloat(url.searchParams.get('duration') || '0') || 0;
       const file = path.join(sessionDir(id), 'transcript.json');
-      let trs = { words: [], settings: { padSec: 0.12, maxGapSec: 1.0 } };
-      try { trs = JSON.parse(await fsp.readFile(file, 'utf8')); } catch {}
-      trs.inserts = trs.inserts || [];
-      trs.inserts.push({
-        id: `ins-${Date.now().toString(36)}`, at, fromSession: from,
-        kind: 'video', duration, label: `recorded insert (${from})`,
+      const count = await withFileLock(file, async () => {
+        let trs = { words: [], settings: { padSec: 0.12, maxGapSec: 1.0 } };
+        try { trs = JSON.parse(await fsp.readFile(file, 'utf8')); } catch {}
+        trs.inserts = trs.inserts || [];
+        trs.inserts.push({
+          id: `ins-${Date.now().toString(36)}`, at, fromSession: from,
+          kind: 'video', duration, label: `recorded insert (${from})`,
+        });
+        await writeAtomic(file, JSON.stringify(trs, null, 2));
+        return trs.inserts.length;
       });
-      await fsp.writeFile(file, JSON.stringify(trs, null, 2));
-      return json(res, 200, { ok: true, inserts: trs.inserts.length });
+      return json(res, 200, { ok: true, inserts: count });
     }
 
     if (p === '/api/meta' && req.method === 'POST') {
       const id = safeSession(url.searchParams.get('session'));
       const patch = JSON.parse((await readBody(req)).toString());
       const file = path.join(sessionDir(id), 'meta.json');
-      let meta = {};
-      try { meta = JSON.parse(await fsp.readFile(file, 'utf8')); } catch {}
-      if (typeof patch.title === 'string' && patch.title.trim()) meta.title = patch.title.trim();
-      if (patch.renderNames && typeof patch.renderNames === 'object') {
-        meta.renderNames = { ...(meta.renderNames || {}), ...patch.renderNames };
-      }
-      await fsp.writeFile(file, JSON.stringify(meta, null, 2));
+      const meta = await withFileLock(file, async () => {
+        let m = {};
+        try { m = JSON.parse(await fsp.readFile(file, 'utf8')); } catch {}
+        if (typeof patch.title === 'string' && patch.title.trim()) m.title = patch.title.trim();
+        if (patch.renderNames && typeof patch.renderNames === 'object') {
+          m.renderNames = { ...(m.renderNames || {}), ...patch.renderNames };
+        }
+        await writeAtomic(file, JSON.stringify(m, null, 2));
+        return m;
+      });
       return json(res, 200, { ok: true, title: meta.title, renderNames: meta.renderNames });
     }
 
@@ -564,7 +639,7 @@ const server = http.createServer(async (req, res) => {
       const libFile = path.join(ROOT, 'music', 'library.json');
       if (!fs.existsSync(libFile)) return json(res, 200, {});
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      return fs.createReadStream(libFile).pipe(res);
+      return sendFile(res, libFile);
     }
 
     if (p === '/api/addmusic' && req.method === 'POST') {
@@ -681,7 +756,7 @@ const server = http.createServer(async (req, res) => {
       if (typeof patch.remote === 'string' && /^[\w.-]+:[^\0]*$/.test(patch.remote.trim())) {
         cfg.remote = patch.remote.trim();
       }
-      await fsp.writeFile(ARCHIVE_CONFIG, JSON.stringify(cfg, null, 2));
+      await withFileLock(ARCHIVE_CONFIG, () => writeAtomic(ARCHIVE_CONFIG, JSON.stringify(cfg, null, 2)));
       return json(res, 200, { ok: true, config: cfg });
     }
 
@@ -809,7 +884,7 @@ const server = http.createServer(async (req, res) => {
         delete files[file];
         if (Object.keys(files).length) meta.archive = { remote, files };
         else delete meta.archive;
-        await fsp.writeFile(metaFile, JSON.stringify(meta, null, 2));
+        await withFileLock(metaFile, () => writeAtomic(metaFile, JSON.stringify(meta, null, 2)));
         return json(res, 200, { ok: true, deleted: `${remote}/${file}`, fromDrive: true });
       }
       await fsp.unlink(path.join(dir, file)).catch(err => { throw err; });
