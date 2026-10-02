@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import shutil
 
 from common import duration_of, load_json, migrate_edits, write_json
+from composite import Live, write_audio
 
 # Whisper is trained to produce CLEAN text and silently drops disfluencies.
 # Seeding the decoder with a filler-laden prompt makes it transcribe them
@@ -89,10 +90,10 @@ def measure_offset(source, composite, fallback, max_lag=3.0):
     """SOURCE time -> COMPOSITE time, measured from the audio itself.
 
     meta.json's webcamOffsetSec is only the recorder's start-time estimate, and
-    the composite on disk can disagree with it (it may predate a re-record, or
-    the webm decode may have swallowed a corrupt leading packet). render.py cuts
-    the composite, so the composite is the timeline that matters — align to it
-    directly and fall back to meta only when the match is weak."""
+    the composite's audio can disagree with it (the webm decode may swallow a
+    corrupt leading packet, or a composite.mp4 may predate a re-record).
+    render.py cuts the composite timeline, so that is the one that matters —
+    align to it directly and fall back to meta only when the match is weak."""
     try:
         import numpy as np
     except ImportError:
@@ -152,9 +153,17 @@ def main():
     meta = load_json(d / "meta.json", {})
     source, offset = pick_audio_source(d, meta)
     comp = d / "composite.mp4"
-    if source.name != comp.name and comp.exists():
-        offset, how = measure_offset(source, comp, offset)
-        print(f"source->composite offset {offset:+.3f}s — {how}", flush=True)
+    if source.name != comp.name:
+        # Align to the composite TIMELINE — the one render.py cuts. Its audio
+        # is built straight from the raw files in a second or two, so this no
+        # longer waits for composite.mp4 (process.py builds that alongside).
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = Path(tmp) / "composite-audio.wav"
+            if not write_audio(d, ref):
+                ref = comp if comp.exists() else None
+            if ref:
+                offset, how = measure_offset(source, ref, offset)
+                print(f"source->composite offset {offset:+.3f}s — {how}", flush=True)
     print(f"transcribing {source.name} (offset {offset:+.3f}s) with model={args.model}", flush=True)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -220,8 +229,9 @@ def main():
         print(f"shifted {len(words)} words by {offset:+.3f}s onto the composite timeline")
 
     composite = d / "composite.mp4"
-    measured = composite if composite.exists() else source
-    duration = duration_of(measured)
+    live = Live.of(d)
+    measured = "the raw recordings" if live else (composite if composite.exists() else source)
+    duration = live.duration() if live else duration_of(measured)
 
     # A duration of 0 (or one that does not even reach the last word) means the
     # probe failed — a half-written composite, a container with no duration
@@ -230,7 +240,7 @@ def main():
     # in it. The speech we just transcribed is a safe floor.
     last_word = max((w["end"] for w in words), default=0.0)
     if duration < last_word + 0.001:
-        print(f"WARNING: {measured.name} reported {duration:.3f}s, which is "
+        print(f"WARNING: {getattr(measured, 'name', measured)} reported {duration:.3f}s, which is "
               f"shorter than the speech in it ({last_word:.3f}s) — falling back "
               f"to the transcript's own length")
         duration = last_word + 0.5

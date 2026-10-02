@@ -548,6 +548,17 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, started: 'composite' });
     }
 
+    // after a recording: transcription and the composite run side by side
+    if (p === '/api/process' && req.method === 'POST') {
+      const id = safeSession(url.searchParams.get('session'));
+      const model = url.searchParams.get('model') || 'small';
+      if (!/^(tiny|base|small|medium|large-v[23](-turbo)?|distil-[\w.-]+)$/.test(model)) {
+        return json(res, 400, { error: 'bad model name' });
+      }
+      runJob(id, 'process', PYTHON, [path.join(SCRIPTS, 'process.py'), sessionDir(id), '--model', model]);
+      return json(res, 200, { ok: true, started: 'process' });
+    }
+
     if (p === '/api/transcribe' && req.method === 'POST') {
       const id = safeSession(url.searchParams.get('session'));
       const model = url.searchParams.get('model') || 'small';

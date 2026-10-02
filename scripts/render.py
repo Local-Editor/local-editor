@@ -13,7 +13,9 @@ write its own intermediate file, which cost a lossy generation and a full trip
 through the hardware encoder per stage — and the encoder, not decoding or
 filtering, is what limits render speed.
 
-Formats: wide (composite.mp4) | short/square (reframe.py intermediate).
+Formats: wide — composited live from screen.webm + webcam.webm (composite.Live),
+or cut from composite.mp4 when those are gone — | short/square (reframe.py
+intermediate).
 --range START END renders only that slice of the source (no arrangement),
 used by the transcript's "render only this part".
 
@@ -33,7 +35,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (ffprobe, has_audio, duration_of, run_ffmpeg, load_json,
                     keep_segments, encode_args, video_stream, clean_time, even,
-                    stream_has_alpha, exit_on_sigterm, build_then_swap)
+                    stream_has_alpha, exit_on_sigterm, build_then_swap, Graph,
+                    warn_if_frames_missing)
+from composite import Live
 import subtitles
 
 
@@ -79,31 +83,14 @@ def intersect(keeps, s0, s1):
     return [(max(a, s0), min(b, s1)) for a, b in keeps if b > s0 and a < s1]
 
 
-class Graph:
-    """One ffmpeg invocation — its inputs and filtergraph, built up piecewise."""
-
-    def __init__(self):
-        self.inputs, self.parts, self._n = [], [], 0
-
-    def input(self, args):
-        self.inputs.append([str(a) for a in args])
-        return len(self.inputs) - 1
-
-    def label(self, kind):
-        self._n += 1
-        return f"[{kind}{self._n}]"
-
-    def add(self, chain):
-        self.parts.append(chain)
-
-    def args(self):
-        return [a for inp in self.inputs for a in inp]
-
-
 def seek_origin(segs, fps):
     """Where to start reading a source that only needs `segs`: a second ahead
-    of the first kept frame, on the frame grid so cut times stay on it too."""
-    return max(0.0, math.floor((segs[0][0] - 1.0) * fps) / fps)
+    of the first kept frame, on the frame grid so cut times stay on it too.
+    Whole multiples of 3 frames (0.1s at 30fps; 100.1ms at 29.97) are also
+    whole microseconds, ffmpeg's seek unit — a seek a fraction of a µs off
+    the grid flips which frame wins a rounding tie, and screen recordings
+    timed in whole ms hit exact half-frame ties all the time."""
+    return max(0.0, math.floor((segs[0][0] - 1.0) * fps / 3) * 3 / fps)
 
 
 def cut_audio(g, stem, segs, origin, pre=None):
@@ -122,27 +109,69 @@ def cut_audio(g, stem, segs, origin, pre=None):
     return out
 
 
-def piece_streams(g, src, segs, fps, audio, mono, pre):
-    """One footage piece: a frame-exact select of `segs` out of `src`.
-    Each piece gets its own input, seeked near its first kept frame — no
+class FileSource:
+    """Footage read from a finished file: composite.mp4, a social reframe,
+    or --input. open() seeks a fresh input to the stretch asked for."""
+
+    def __init__(self, path):
+        info = ffprobe(path)
+        vs = video_stream(info)
+        a_st = next((x for x in info["streams"] if x["codec_type"] == "audio"), None)
+        self.path = path
+        self.W, self.H = even(int(vs["width"])), even(int(vs["height"]))
+        self.fps, self.rate = probe_rate(path)
+        self.audio = a_st is not None
+        self.mono = self.audio and int(a_st.get("channels", 2)) == 1
+        self.dur = duration_of(path)
+
+    def open(self, g, origin, end):
+        """(video, audio-or-None) labels for [origin, end), with t=0 at origin."""
+        idx = g.input((["-ss", f"{origin:.6f}"] if origin > 0 else [])
+                      + ["-t", f"{end - origin:.6f}", "-i", self.path])
+        return f"[{idx}:v]", (f"[{idx}:a]" if self.audio else None)
+
+
+class LiveSource:
+    """Footage composited on the fly from a session's raw recordings (see
+    composite.Live): the same picture and sound as its composite.mp4, without
+    encoding that file first or cutting a lossy copy of it."""
+
+    def __init__(self, live, mask_dir):
+        self.live, self.mask_dir = live, mask_dir
+        self.W, self.H = live.W, live.H
+        self.fps, self.rate = 30.0, "30/1"           # composite.py's fps=30
+        self.audio, self.mono = True, False
+        self.dur = live.duration()
+
+    def open(self, g, origin, end):
+        v = self.live.video(g, self.mask_dir, origin, end)
+        a = g.label("la")
+        # stereo the way composite.mp4's is (aformat's upmix, as -ac 2 does
+        # there), so a live render sounds exactly like one cut from the file
+        g.add(f"{self.live.audio(g)}atrim=start={origin:.6f}:end={end:.6f},"
+              f"asetpts=PTS-STARTPTS,{STEREO}{a}")
+        return v, a
+
+
+def piece_streams(g, source, segs, fps, pre):
+    """One footage piece: a frame-exact select of `segs` out of `source`.
+    Each piece opens its own stretch, seeked near its first kept frame — no
     decoding of footage it never shows, and pieces play in any order without
     one waiting on (and buffering) another. Video and audio come out exactly
     sum(b - a) long, so the pieces concatenate in sync."""
     origin = seek_origin(segs, fps)
-    span = segs[-1][1] - origin + 1.0
-    idx = g.input((["-ss", f"{origin:.6f}"] if origin > 0 else [])
-                  + ["-t", f"{span:.6f}", "-i", src])
+    sv, sa = source.open(g, origin, segs[-1][1] + 1.0)
     half = 0.5 / fps
     vsel = "+".join(f"between(t,{a - origin - half:.5f},{b - origin - half:.5f})"
                     for a, b in segs)
     v = g.label("pv")
-    g.add(f"[{idx}:v]select='{vsel}',setpts=N/FRAME_RATE/TB,setsar=1{v}")
+    g.add(f"{sv}select='{vsel}',setpts=N/FRAME_RATE/TB,setsar=1{v}")
     a = g.label("pa")
-    if audio:
-        cut = cut_audio(g, f"[{idx}:a]", segs, origin, pre)
+    if sa:
+        cut = cut_audio(g, sa, segs, origin, pre)
         # mono voice: upmix at unity (c0->both), NOT aformat's 0.707 pan-law —
         # players duplicate mono at full level, so 0.707 renders 3dB quiet
-        g.add(f"{cut}{'pan=stereo|c0=c0|c1=c0,' if mono else ''}{STEREO}{a}")
+        g.add(f"{cut}{'pan=stereo|c0=c0|c1=c0,' if source.mono else ''}{STEREO}{a}")
     else:
         g.add(f"anullsrc=r=48000:cl=stereo,atrim=duration={sum(b - a for a, b in segs):.6f}{a}")
     return v, a
@@ -172,17 +201,25 @@ def resolve_insert(d, ins):
     return f if f.exists() else None
 
 
-def overlay_streams(g, d, ins, W, H, fps, rate, ft, denoise_for):
+def overlay_streams(g, d, ins, W, H, fps, rate, ft, footage, denoise_for):
     """Insert clip -> (video, audio-or-None, ox, oy, length) placed at output
     time `ft`. Framed clips (ins.frame) scale to the frame width at their own
     aspect and sit at (ox, oy); others fill the screen. Transparent sources
-    stay transparent. Returns None when the file is missing or fully cut."""
-    f = resolve_insert(d, ins)
-    if not f:
+    stay transparent. A recording's footage comes live from its raw files when
+    they're on disk (`footage`). Returns None when missing or fully cut."""
+    live, own = footage(ins)
+    f = None if live else resolve_insert(d, ins)
+    if not live and not f:
         return None
-    probe = ffprobe(f)
-    vs = video_stream(probe)
-    alpha = stream_has_alpha(vs)
+    # footage of this same recording carries the same voice — clean it too
+    if live:
+        vs, alpha, audio, total = True, False, True, live.dur
+        pre = denoise_for(None) if own else None
+    else:
+        probe = ffprobe(f)
+        vs = video_stream(probe)
+        alpha, audio, total = stream_has_alpha(vs), has_audio(probe), duration_of(f)
+        pre = denoise_for(f)
     frame = ins.get("frame")
     ox = int(float(frame["x"]) * W) if frame else 0
     oy = int(float(frame["y"]) * H) if frame else 0
@@ -190,7 +227,7 @@ def overlay_streams(g, d, ins, W, H, fps, rate, ft, denoise_for):
     # (right-edge trims change duration without srcStart)
     src_start = float(ins.get("srcStart") or 0)
     dur_used = float(ins.get("duration") or 0)
-    remaining = max(0.0, duration_of(f) - src_start)
+    remaining = max(0.0, total - src_start)
     length = dur_used if 0 < dur_used < remaining - 0.05 else remaining
     if length < 0.05:
         return None
@@ -212,18 +249,22 @@ def overlay_streams(g, d, ins, W, H, fps, rate, ft, denoise_for):
             return None
     out_len = sum(b - a for a, b in keeps) if keeps else length
 
-    # ffmpeg's native vp9 decoder silently drops the alpha plane
-    dec = ["-c:v", "libvpx-vp9"] if alpha and f.suffix.lower() == ".webm" else []
-    seek = ["-ss", f"{src_start:.6f}"] if src_start > 0.01 else []
-    idx = g.input(dec + seek + ["-t", f"{length:.6f}", "-i", f])
+    if live:
+        sv, sa = live.open(g, src_start, src_start + length)
+    else:
+        # ffmpeg's native vp9 decoder silently drops the alpha plane
+        dec = ["-c:v", "libvpx-vp9"] if alpha and f.suffix.lower() == ".webm" else []
+        seek = ["-ss", f"{src_start:.6f}"] if src_start > 0.01 else []
+        idx = g.input(dec + seek + ["-t", f"{length:.6f}", "-i", f])
+        sv, sa = f"[{idx}:v]", (f"[{idx}:a]" if audio else None)
 
     if vs:
         if frame:
             fw = even(max(64, float(frame["w"]) * W))
-            chain = f"[{idx}:v]scale={fw}:-2"
+            chain = f"{sv}scale={fw}:-2"
         else:
             pad_color = ":color=black@0" if alpha else ""
-            chain = (f"[{idx}:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+            chain = (f"{sv}scale={W}:{H}:force_original_aspect_ratio=decrease,"
                      f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2{pad_color}")
         chain += f",fps={rate},setsar=1" + (",format=yuva420p" if alpha else "")
     else:
@@ -237,10 +278,8 @@ def overlay_streams(g, d, ins, W, H, fps, rate, ft, denoise_for):
     g.add(chain + f",setpts=PTS-STARTPTS+{ft:.6f}/TB{v}")
 
     a = None
-    if has_audio(probe):
-        # footage of this same recording carries the same voice — clean it too
-        pre = denoise_for(f)
-        stem = f"[{idx}:a]"
+    if sa:
+        stem = sa
         if keeps:
             stem = cut_audio(g, stem, keeps, 0.0, pre)
             pre = None
@@ -321,25 +360,37 @@ def write_captions(cues, tr, W, H, tmpdir, to_output):
     return layer
 
 
-def prepare_source(d, args, tr):
-    """The recording to cut, and the file to write. Rebuilds the composite
-    when the webcam-bubble placement changed; builds the social reframe once."""
+def prepare_source(d, args, tr, live_for):
+    """The footage to cut, and the file to write. A wide render composites
+    live from the raw recordings when they're on disk. Otherwise it cuts
+    composite.mp4 — rebuilt when a piece's bubble moved, if the raws are there
+    to rebuild it from — or, for a social format, the reframe (built once)."""
     if args.fmt == "wide":
-        src = d / (args.input or "composite.mp4")
         out = d / (args.output or ("clean-part.mp4" if args.range else "clean.mp4"))
-        cam_segs = sorted([sg for sg in (tr.get("segments") or []) if sg.get("cam")],
-                          key=lambda sg: float(sg["s0"]))
-        want_layouts = json.dumps(
-            [[round(float(sg["s0"]), 2), round(float(sg["s1"]), 2), sg["cam"]]
-             for sg in cam_segs], sort_keys=True)
-        sidecar = d / ".composite-layouts.json"
-        have_layouts = sidecar.read_text() if sidecar.exists() else "[]"
-        if not src.exists() or want_layouts != have_layouts:
-            print("»stage composite", flush=True)
-            print("building composite (webcam-bubble layout changed)"
-                  if src.exists() else "no composite.mp4 — building it first", flush=True)
-            subprocess.run([sys.executable, str(Path(__file__).parent / "composite.py"),
-                            str(d)], check=True)
+        live = None if args.input else live_for(d)
+        if live:
+            print("compositing live from the raw recordings", flush=True)
+            return live, out
+        src = d / (args.input or "composite.mp4")
+        if src.name == "composite.mp4":
+            cam_segs = sorted([sg for sg in (tr.get("segments") or []) if sg.get("cam")],
+                              key=lambda sg: float(sg["s0"]))
+            want_layouts = json.dumps(
+                [[round(float(sg["s0"]), 2), round(float(sg["s1"]), 2), sg["cam"]]
+                 for sg in cam_segs], sort_keys=True)
+            sidecar = d / ".composite-layouts.json"
+            have_layouts = sidecar.read_text() if sidecar.exists() else "[]"
+            raws = (d / "screen.webm").exists() or (d / "webcam.webm").exists()
+            if not src.exists() or (want_layouts != have_layouts and raws):
+                print("»stage composite", flush=True)
+                print("building composite (webcam-bubble layout changed)"
+                      if src.exists() else "no composite.mp4 — building it first", flush=True)
+                subprocess.run([sys.executable, str(Path(__file__).parent / "composite.py"),
+                                str(d)], check=True)
+            elif want_layouts != have_layouts:
+                print("the bubble placement changed, but the raw recording isn't on "
+                      "disk to rebuild from (archived?) — rendering the existing "
+                      "composite", flush=True)
     else:
         src = d / f"reframe-{args.fmt}-{args.layout}.mp4"
         out = d / (args.output or f"clean-{args.fmt}-{args.layout}.mp4")
@@ -349,7 +400,7 @@ def prepare_source(d, args, tr):
             subprocess.run([sys.executable, str(Path(__file__).parent / "reframe.py"),
                             str(d), "--format", args.fmt, "--layout", args.layout,
                             "--quality", args.quality], check=True)
-    return src, out
+    return FileSource(src), out
 
 
 def main():
@@ -375,22 +426,46 @@ def main():
     tr = load_json(d / "transcript.json")
     if not tr:
         sys.exit("no transcript.json — run transcribe first")
-    src, out = prepare_source(d, args, tr)
+    tmp = tempfile.TemporaryDirectory(prefix="render-")
+    tmpdir = Path(tmp.name)
 
-    info = ffprobe(src)
-    dur = duration_of(src)
-    fps, rate = probe_rate(src)
-    a_st = next((s for s in info["streams"] if s["codec_type"] == "audio"), None)
-    audio = a_st is not None
-    mono = audio and int(a_st.get("channels", 2)) == 1
-    vs = video_stream(info)
-    W, H = even(int(vs["width"])), even(int(vs["height"]))
+    lives = {}
+
+    def live_for(sd):
+        """LiveSource for session folder `sd`, or None when its raw recordings
+        aren't there to composite from (see composite.Live.of)."""
+        key = sd.resolve()
+        if key not in lives:
+            lv = Live.of(sd, tr if key == d.resolve() else None)
+            lives[key] = LiveSource(lv, tmpdir) if lv else None
+        return lives[key]
+
+    source, out = prepare_source(d, args, tr, live_for)
+    W, H, fps, rate, dur = source.W, source.H, source.fps, source.rate, source.dur
     keeps_all = [(max(0.0, a), min(b, dur)) for a, b in keep_segments(tr) if a < dur]
     pre = denoise_chain() if args.denoise else None
-    own_footage = {src.resolve(), (d / "composite.mp4").resolve()}
+    own_files = {(d / "composite.mp4").resolve()}
+    if isinstance(source, FileSource):
+        own_files.add(source.path.resolve())
 
     def denoise_for(f):
-        return pre if pre and f.resolve() in own_footage else None
+        """The voice clean-up, for this recording's own footage (f=None: it is)."""
+        return pre if pre and (f is None or f.resolve() in own_files) else None
+
+    def footage(ins):
+        """(LiveSource, is-this-recording) when `ins` plays a recording's
+        composite and that recording's raw files are on disk, else (None, _)."""
+        if ins.get("musicTrack"):
+            return None, False
+        if ins.get("fromSession"):
+            if (ins.get("fromFile") or "composite.mp4") != "composite.mp4":
+                return None, False
+            sd = RECORDINGS / ins["fromSession"]
+        elif ins.get("file") == "composite.mp4":
+            sd = d
+        else:
+            return None, False
+        return live_for(sd), sd.resolve() == d.resolve()
 
     segments = sorted(tr.get("segments") or
                       [{"id": "seg1", "s0": 0.0, "s1": dur, "pos": 0.0}],
@@ -406,8 +481,6 @@ def main():
         print("removing background noise from the voice", flush=True)
 
     g = Graph()
-    tmp = tempfile.TemporaryDirectory(prefix="render-")
-    tmpdir = Path(tmp.name)
 
     # ---- main track: footage pieces (and black gaps) in timeline order ----
     seq = []             # (video, audio) labels to concatenate
@@ -419,7 +492,7 @@ def main():
         segs = snap_keeps(keeps, fps)
         if not segs:
             sys.exit("nothing kept inside the selected range")
-        seq.append(piece_streams(g, src, segs, fps, audio, mono, pre))
+        seq.append(piece_streams(g, source, segs, fps, pre))
         out_t = sum(b - a for a, b in segs)
         overlays, music_ins = [], []
 
@@ -440,7 +513,7 @@ def main():
             segs = snap_keeps(keeps, fps)
             eff = sum(b - a for a, b in segs)
             if segs:
-                seq.append(piece_streams(g, src, segs, fps, audio, mono, pre))
+                seq.append(piece_streams(g, source, segs, fps, pre))
             blocks.append({"arr0": sg["pos"], "arrLen": raw_len, "out0": out_t,
                            "kind": "piece", "sg": sg, "keeps": keeps, "effLen": eff})
             out_t += eff
@@ -482,9 +555,9 @@ def main():
     placed = []
     for ins in overlays:
         ft = to_output(float(ins.get("at", 0)))
-        res = overlay_streams(g, d, ins, W, H, fps, rate, ft, denoise_for)
+        res = overlay_streams(g, d, ins, W, H, fps, rate, ft, footage, denoise_for)
         if not res:
-            if not resolve_insert(d, ins):
+            if not footage(ins)[0] and not resolve_insert(d, ins):
                 print(f"overlay {ins.get('id')}: file missing — skipped", flush=True)
             continue
         placed.append((ft,) + res)
@@ -583,6 +656,7 @@ def main():
     finally:
         tmp.cleanup()
     print(f"clean video: {out} ({duration_of(out):.1f}s)", flush=True)
+    warn_if_frames_missing(out)
 
 
 if __name__ == "__main__":

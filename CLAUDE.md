@@ -105,6 +105,28 @@ Notes:
   (~150 fps at 3K) is the bottleneck, so each extra pass costs a full encode
   and a generation of quality. Overlay times come from `to_output()`, which
   must count gaps in the same whole frames the graph renders.
+- Wide renders don't cut `composite.mp4`: they composite **live** from
+  `screen.webm` + `webcam.webm` through `composite.Live`, the same description
+  `composite.py` encodes into `composite.mp4` — so the two can't drift, a
+  render costs one encode instead of two, and moving a piece's bubble needs no
+  rebuild. Footage overlays (`file: composite.mp4`, or another session's
+  composite) come live from raws too. `composite.mp4` is the fallback when the
+  raws are gone (archived) or the recording has no mic track, and it is still
+  what the editor previews footage overlays with, `subsession.py` slices, and
+  other edits' 📼 picker offers. Two seek rules in `Live.video()`: the screen
+  is read with `-noaccurate_seek` (a still screen goes seconds without a frame,
+  so the fps filter needs the one before the seek point) and ended by an
+  in-graph `trim` (its `-t` would count from that keyframe); seek points are
+  whole multiples of 3 frames (`seek_origin`), which are exact in
+  microseconds — off-grid seeks flip rounding ties on ms-timed screen frames.
+  The mic is never seeked: its timestamps must come from the sample count.
+- After recording, the Process button runs `process.py`: transcription and
+  the composite build side by side. `transcribe.py` aligns words to the
+  composite's audio built straight from the raws (`composite.write_audio`),
+  so it never waits for `composite.mp4`.
+- System audio is mixed under the mic with `composite.SYSTEM_MIX`
+  (`normalize=0` + a latency-compensated limiter). amix's default normalize
+  divided the mic by 1.6 — recordings with system audio came out 4 dB quieter.
 - `encode_args()` always passes `-g` to VideoToolbox. Without it ffmpeg hands
   the encoder its generic default of 12 — a keyframe every 0.4s — and files
   come out ~20% bigger and softer. The `QUALITY` tiers were calibrated by SSIM

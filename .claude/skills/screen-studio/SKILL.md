@@ -40,11 +40,12 @@ Recorder at `/`, transcript editing dashboard at `/editor.html`.
 
 **Find the latest session:** newest directory in `$STUDIO/recordings/`.
 
-**Full pipeline on a session (composite → transcribe → auto-clean → render):**
+**Full pipeline on a session (transcribe + composite → auto-clean → render):**
 ```bash
 PY="$STUDIO/.venv/bin/python3"; S="$STUDIO/recordings/<session>"
-"$PY" "$STUDIO/scripts/composite.py"  "$S"
-"$PY" "$STUDIO/scripts/transcribe.py" "$S" --model small  # default; large-v3-turbo = best, ~1.6GB download
+"$PY" "$STUDIO/scripts/process.py"    "$S" --model small  # transcribe + build composite.mp4 side by side
+# (default model; large-v3-turbo = best, ~1.6GB download). Either half also runs
+# alone: composite.py <session> / transcribe.py <session> --model …
 # transcribe primes Whisper to keep umms verbatim, and inserts "(um?)" markers
 # (detected:true) for audible gap sounds Whisper refused to write — enhance.py
 # auto-cuts the short ones. It backs up any existing transcript.json first.
