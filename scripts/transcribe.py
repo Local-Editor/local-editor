@@ -15,7 +15,9 @@ import wave
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import duration_of, load_json, migrate_edits
+import shutil
+
+from common import duration_of, load_json, migrate_edits, write_json
 
 # Whisper is trained to produce CLEAN text and silently drops disfluencies.
 # Seeding the decoder with a filler-laden prompt makes it transcribe them
@@ -162,15 +164,30 @@ def main():
 
         from faster_whisper import WhisperModel
         model = WhisperModel(args.model, device="cpu", compute_type="int8")
-        segments, info = model.transcribe(
-            str(wav), language=args.language, word_timestamps=True,
-            initial_prompt=VERBATIM_PROMPT,
-            # hotwords re-inject the verbatim style into EVERY 30s window
-            # (initial_prompt only reaches the first one when
-            # condition_on_previous_text is off)
-            hotwords=VERBATIM_PROMPT,
-            condition_on_previous_text=False,
-            vad_filter=True, vad_parameters={"min_silence_duration_ms": 400})
+        opts = dict(language=args.language, word_timestamps=True,
+                    initial_prompt=VERBATIM_PROMPT,
+                    # hotwords re-inject the verbatim style into every 30s
+                    # window on the sequential path, where initial_prompt only
+                    # reaches the first one (condition_on_previous_text is off)
+                    hotwords=VERBATIM_PROMPT,
+                    condition_on_previous_text=False,
+                    vad_filter=True, vad_parameters={"min_silence_duration_ms": 400})
+        try:
+            from faster_whisper import BatchedInferencePipeline
+        except ImportError:                      # faster-whisper < 1.1
+            BatchedInferencePipeline = None
+        if BatchedInferencePipeline:
+            # Batched mode primes EVERY speech chunk with the verbatim prompt.
+            # Measured on a real 4-min take (large-v3-turbo): 13 fillers found
+            # vs 8 — the sequential decoder folded the rest into the next
+            # word's timestamps ("social" starting on the "um" before it), so
+            # those umms could not be cut at all. Greedy decoding (beam 1)
+            # makes it ~12% faster too, with word timings unchanged (median
+            # 0ms, p90 20ms against the beam-5 run).
+            segments, info = BatchedInferencePipeline(model=model).transcribe(
+                str(wav), batch_size=8, beam_size=1, **opts)
+        else:
+            segments, info = model.transcribe(str(wav), **opts)
 
         words = []
         for seg in segments:
@@ -239,9 +256,10 @@ def main():
         n = 1
         while (d / f"transcript.backup{n}.json").exists():
             n += 1
-        out.rename(d / f"transcript.backup{n}.json")
+        # copy, not rename: transcript.json must never be missing, even briefly
+        shutil.copyfile(out, d / f"transcript.backup{n}.json")
         print(f"previous transcript backed up to transcript.backup{n}.json")
-    out.write_text(json.dumps(transcript, indent=2))
+    write_json(out, transcript)
     print(f"transcript.json written: {len(words)} words, language={info.language}")
 
 

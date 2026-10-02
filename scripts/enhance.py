@@ -26,6 +26,9 @@ import sys
 from difflib import SequenceMatcher
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from common import write_json
+
 FILLERS = {"um", "uh", "uhm", "umm", "erm", "er", "ah", "eh", "hmm", "hm", "mmm", "mm"}
 
 
@@ -144,7 +147,7 @@ def main():
     if args.max_gap is not None:
         tr.setdefault("settings", {})["maxGapSec"] = args.max_gap
 
-    path.write_text(json.dumps(tr, indent=2))
+    write_json(path, tr)
     total = sum(counts.values())
     print(f"enhance: marked {total} words — " +
           ", ".join(f"{v} {k}" for k, v in counts.items() if v))

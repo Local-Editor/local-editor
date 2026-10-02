@@ -97,6 +97,23 @@ Notes:
   edit. Raw `screen.webm`/`webcam.webm` are never modified by anything.
 - `keep_segments()` in `scripts/common.py` mirrors `keepSegments()` in
   `public/editor.js` — if you change one, change the other.
+- `render.py` is ONE ffmpeg pass: every footage piece is its own input seeked
+  near its first kept frame (`-ss`/`-t`), cut with a frame-snapped `select`
+  plus `atrim`/`concat` audio, concatenated with black gaps (whole frames),
+  then overlays, music and captions are layered in the same filtergraph and
+  encoded once. Don't reintroduce intermediate encodes: the hardware encoder
+  (~150 fps at 3K) is the bottleneck, so each extra pass costs a full encode
+  and a generation of quality. Overlay times come from `to_output()`, which
+  must count gaps in the same whole frames the graph renders.
+- `encode_args()` always passes `-g` to VideoToolbox. Without it ffmpeg hands
+  the encoder its generic default of 12 — a keyframe every 0.4s — and files
+  come out ~20% bigger and softer. The `QUALITY` tiers were calibrated by SSIM
+  with that interval; recalibrate if you change it.
+- Outputs are written via `build_then_swap()` (temp name, renamed on success)
+  and scripts call `exit_on_sigterm()`, so a cancelled job never leaves a
+  short-but-valid composite/reframe/render under the real name. JSON sidecars
+  are written with `write_json()` / `update_json()` (Python) and
+  `withFileLock()` + `writeAtomic()` (server.js) — never a plain overwrite.
 - Subtitles are inserts of `kind: "subtitle"` on their own timeline. The
   editor's 💬 button builds them from the transcript; `scripts/subtitles.py`
   draws them with Pillow (ffmpeg is never asked to render text — plenty of

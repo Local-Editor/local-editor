@@ -6,6 +6,12 @@ Pipeline:
   2. segments          -> scissor pieces placed on the timeline (gaps = black)
   3. overlays          -> inserts composited ON TOP at their timeline position
                           (audio mixed in; can extend past the end)
+  4. music + captions  -> beds ducked under the voice, captions burned on top
+
+All four stages are ONE filtergraph feeding ONE encode. Each stage used to
+write its own intermediate file, which cost a lossy generation and a full trip
+through the hardware encoder per stage — and the encoder, not decoding or
+filtering, is what limits render speed.
 
 Formats: wide (composite.mp4) | short/square (reframe.py intermediate).
 --range START END renders only that slice of the source (no arrangement),
@@ -14,8 +20,11 @@ used by the transcript's "render only this part".
 Usage: render.py <session-dir> [--quality high|balanced|small]
                  [--format wide|short|square] [--layout cam-top|cam-bottom|overlay]
                  [--range START END] [--input X] [--output Y]
+                 [--compress] [--denoise]
 """
 import argparse
+import json
+import math
 import subprocess
 import sys
 import tempfile
@@ -24,97 +33,128 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (ffprobe, has_audio, duration_of, run_ffmpeg, load_json,
                     keep_segments, encode_args, video_stream, clean_time, even,
-                    compress_to_hevc, stream_has_alpha)
+                    stream_has_alpha, exit_on_sigterm, build_then_swap)
 import subtitles
 
 
 DENOISE_MODEL = Path(__file__).resolve().parent / "models" / "rnnoise.rnnn"
-
-
-def _denoise_source(src):
-    """Return a copy of `src` with background noise stripped from the voice (video
-    stream copied untouched). RNNoise (arnndn) isolates a single speaker best —
-    ~27 dB of steady background removed with the voice essentially unchanged —
-    falling back to an FFT denoise if the model is absent. Applied to the SOURCE
-    so every cut/arrange/mix path downstream inherits the cleaned voice; music
-    beds are added later and stay untouched."""
-    if not has_audio(ffprobe(src)):
-        return src
-    print("»stage denoise", flush=True)
-    print("removing background noise from the voice", flush=True)
-    dtmp = Path(tempfile.mkdtemp(prefix="denoise-"))
-    out = dtmp / (src.stem + ".mp4")
-    if DENOISE_MODEL.exists():
-        af = f"highpass=f=80,arnndn=m={DENOISE_MODEL}"      # spaces in path are fine
-    else:
-        af = "highpass=f=80,afftdn=nr=20:nf=-30:tn=1"        # built-in fallback
-    run_ffmpeg(["-i", str(src), "-map", "0", "-c:v", "copy", "-af", af,
-                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)])
-    return out
-
-
-def _maybe_compress(out, args):
-    """Optional final pass: shrink the finished render to visually-lossless H.265."""
-    if not getattr(args, "compress", False):
-        return
-    print("»stage compress", flush=True)
-    res = compress_to_hevc(out)
-    if res:
-        before, after = res
-        pct = 100 * (1 - after / before)
-        print(f"compressed {before / 1e6:.1f}MB → {after / 1e6:.1f}MB "
-              f"({pct:.0f}% smaller, H.265)", flush=True)
-    else:
-        print("compression left the file as-is (already efficient)", flush=True)
-
 RECORDINGS = Path(__file__).resolve().parent.parent / "recordings"
+MUSIC_DIR = Path(__file__).resolve().parent.parent / "music"
+STEREO = "aformat=sample_rates=48000:channel_layouts=stereo"
 
 
-def probe_fps(src):
+def denoise_chain():
+    """Voice clean-up applied to the source audio before it is cut. RNNoise
+    (arnndn) isolates a single speaker best — ~27 dB of steady background
+    removed with the voice essentially unchanged — with an FFT denoise as the
+    fallback when the model is absent. Music beds join later, untouched."""
+    if DENOISE_MODEL.exists():
+        return f"highpass=f=80,arnndn=m='{DENOISE_MODEL}'"
+    return "highpass=f=80,afftdn=nr=20:nf=-30:tn=1"
+
+
+def probe_rate(src):
+    """(fps, rate) — `rate` is the exact rational for filters, so a 29.97
+    source isn't rounded to 29.97 flat and slowly drifted."""
     vs = video_stream(ffprobe(src))
     try:
-        num, den = vs["r_frame_rate"].split("/")
-        fps = float(num) / float(den)
+        num, den = (int(x) for x in vs["r_frame_rate"].split("/"))
+        fps = num / den
+        if 0 < fps <= 240:
+            return fps, f"{num}/{den}"
     except Exception:
-        fps = 0
-    return fps if 0 < fps <= 240 else 30.0
+        pass
+    return 30.0, "30"
 
 
-def snap_to(fps):
-    return lambda t: round(t * fps) / fps
-
-
-def cut_piece(src, keeps, fps, quality, audio, out):
-    """One-pass select cut of `keeps` (source times) -> out. Frame-snapped
-    boundaries keep video and audio timelines identical (sync!)."""
-    snap = snap_to(fps)
-    segs = [(snap(a), snap(b)) for a, b in keeps]
-    segs = [(a, b) for a, b in segs if b - a >= 1.0 / fps]
-    if not segs:
-        return 0.0
-    half = 0.5 / fps
-    vsel = "+".join(f"between(t,{a - half:.5f},{b - half:.5f})" for a, b in segs)
-    parts = [f"[0:v]select='{vsel}',setpts=N/FRAME_RATE/TB[v]"]
-    if audio:
-        pads = []
-        for k, (a, b) in enumerate(segs):
-            parts.append(f"[0:a]atrim={a:.5f}:{b:.5f},asetpts=PTS-STARTPTS[a{k}]")
-            pads.append(f"[a{k}]")
-        parts.append("".join(pads) + f"concat=n={len(segs)}:v=0:a=1[a]")
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
-        f.write(";".join(parts))
-        script = f.name
-    maps = ["-map", "[v]"] + (["-map", "[a]"] if audio else [])
-    run_ffmpeg(["-i", str(src), "-filter_complex_script", script] + maps +
-               encode_args(quality) + [str(out)])
-    return sum(b - a for a, b in segs)
+def snap_keeps(keeps, fps):
+    """Keep spans snapped to the frame grid. Video can only cut on whole frames
+    while audio cuts exactly, so unsnapped boundaries let the two drift a
+    little per cut — ~1s of lip-sync drift over 300 cuts."""
+    segs = [(round(a * fps) / fps, round(b * fps) / fps) for a, b in keeps]
+    return [(a, b) for a, b in segs if b - a >= 1.0 / fps]
 
 
 def intersect(keeps, s0, s1):
     return [(max(a, s0), min(b, s1)) for a, b in keeps if b > s0 and a < s1]
 
 
-MUSIC_DIR = Path(__file__).resolve().parent.parent / "music"
+class Graph:
+    """One ffmpeg invocation — its inputs and filtergraph, built up piecewise."""
+
+    def __init__(self):
+        self.inputs, self.parts, self._n = [], [], 0
+
+    def input(self, args):
+        self.inputs.append([str(a) for a in args])
+        return len(self.inputs) - 1
+
+    def label(self, kind):
+        self._n += 1
+        return f"[{kind}{self._n}]"
+
+    def add(self, chain):
+        self.parts.append(chain)
+
+    def args(self):
+        return [a for inp in self.inputs for a in inp]
+
+
+def seek_origin(segs, fps):
+    """Where to start reading a source that only needs `segs`: a second ahead
+    of the first kept frame, on the frame grid so cut times stay on it too."""
+    return max(0.0, math.floor((segs[0][0] - 1.0) * fps) / fps)
+
+
+def cut_audio(g, stem, segs, origin, pre=None):
+    """Concatenate `segs` (source times; the input's t=0 is source `origin`)
+    out of audio `stem` -> label. atrim+concat, because aselect does not drop
+    audio frames on ffmpeg 8."""
+    split = [g.label("as") for _ in segs]
+    g.add(f"{stem}{pre + ',' if pre else ''}asplit={len(segs)}{''.join(split)}")
+    pads = []
+    for (a, b), s in zip(segs, split):
+        lab = g.label("ak")
+        g.add(f"{s}atrim={a - origin:.5f}:{b - origin:.5f},asetpts=PTS-STARTPTS{lab}")
+        pads.append(lab)
+    out = g.label("ac")
+    g.add("".join(pads) + f"concat=n={len(pads)}:v=0:a=1{out}")
+    return out
+
+
+def piece_streams(g, src, segs, fps, audio, mono, pre):
+    """One footage piece: a frame-exact select of `segs` out of `src`.
+    Each piece gets its own input, seeked near its first kept frame — no
+    decoding of footage it never shows, and pieces play in any order without
+    one waiting on (and buffering) another. Video and audio come out exactly
+    sum(b - a) long, so the pieces concatenate in sync."""
+    origin = seek_origin(segs, fps)
+    span = segs[-1][1] - origin + 1.0
+    idx = g.input((["-ss", f"{origin:.6f}"] if origin > 0 else [])
+                  + ["-t", f"{span:.6f}", "-i", src])
+    half = 0.5 / fps
+    vsel = "+".join(f"between(t,{a - origin - half:.5f},{b - origin - half:.5f})"
+                    for a, b in segs)
+    v = g.label("pv")
+    g.add(f"[{idx}:v]select='{vsel}',setpts=N/FRAME_RATE/TB,setsar=1{v}")
+    a = g.label("pa")
+    if audio:
+        cut = cut_audio(g, f"[{idx}:a]", segs, origin, pre)
+        # mono voice: upmix at unity (c0->both), NOT aformat's 0.707 pan-law —
+        # players duplicate mono at full level, so 0.707 renders 3dB quiet
+        g.add(f"{cut}{'pan=stereo|c0=c0|c1=c0,' if mono else ''}{STEREO}{a}")
+    else:
+        g.add(f"anullsrc=r=48000:cl=stereo,atrim=duration={sum(b - a for a, b in segs):.6f}{a}")
+    return v, a
+
+
+def gap_streams(g, frames, fps, rate, W, H):
+    """`frames` frames of black + matching silence."""
+    v, a = g.label("gv"), g.label("ga")
+    g.add(f"color=c=black:s={W}x{H}:r={rate},format=yuv420p,setsar=1,"
+          f"trim=end_frame={frames},setpts=PTS-STARTPTS{v}")
+    g.add(f"anullsrc=r=48000:cl=stereo,atrim=duration={frames / fps:.6f}{a}")
+    return v, a
 
 
 def resolve_insert(d, ins):
@@ -132,72 +172,83 @@ def resolve_insert(d, ins):
     return f if f.exists() else None
 
 
-def normalize_overlay(d, ins, W, H, fps, quality, tmpdir, k):
-    """Insert file -> normalized clip with its own cuts applied.
-    Returns (file, ox, oy): framed clips (ins.frame) scale to the frame width
-    at their own aspect and overlay at (ox, oy); others fill the screen.
-    Transparent sources stay transparent (ProRes 4444 intermediate)."""
+def overlay_streams(g, d, ins, W, H, fps, rate, ft, denoise_for):
+    """Insert clip -> (video, audio-or-None, ox, oy, length) placed at output
+    time `ft`. Framed clips (ins.frame) scale to the frame width at their own
+    aspect and sit at (ox, oy); others fill the screen. Transparent sources
+    stay transparent. Returns None when the file is missing or fully cut."""
     f = resolve_insert(d, ins)
     if not f:
         return None
     probe = ffprobe(f)
-    alpha = stream_has_alpha(video_stream(probe))
-    norm = tmpdir / (f"ov{k}.mov" if alpha else f"ov{k}.mp4")
-    # ffmpeg's native vp9 decoder silently drops the alpha plane
-    dec = ["-c:v", "libvpx-vp9"] if alpha and f.suffix.lower() == ".webm" else []
-    enc = (["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
-            "-c:a", "aac", "-b:a", "192k"] if alpha else encode_args(quality))
+    vs = video_stream(probe)
+    alpha = stream_has_alpha(vs)
     frame = ins.get("frame")
     ox = int(float(frame["x"]) * W) if frame else 0
     oy = int(float(frame["y"]) * H) if frame else 0
-    # trim: srcStart = in-point into the source, duration = length used.
-    # Apply -ss when trimmed in, and -t whenever a duration shorter than the
-    # source is set (right-edge trims change duration without srcStart).
+    # trim: srcStart = in-point into the source, duration = length used
+    # (right-edge trims change duration without srcStart)
     src_start = float(ins.get("srcStart") or 0)
     dur_used = float(ins.get("duration") or 0)
-    src_total = duration_of(f)
-    seek = []
-    if src_start > 0.01:
-        seek += ["-ss", f"{src_start:.3f}"]
-    if 0 < dur_used < src_total - src_start - 0.05:
-        seek += ["-t", f"{dur_used:.3f}"]
-    if video_stream(probe):
-        if frame:
-            fw = even(max(64, float(frame["w"]) * W))
-            vf = f"scale={fw}:-2,fps={fps:g},setsar=1"
-        else:
-            pad_color = ":color=black@0" if alpha else ""
-            vf = (f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
-                  f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2{pad_color},fps={fps:g},setsar=1")
-        args = dec + seek + ["-i", str(f), "-vf", vf]
-        if not has_audio(probe):
-            args = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"] + dec + seek + \
-                   ["-i", str(f), "-vf", vf, "-map", "1:v", "-map", "0:a", "-shortest"]
-    else:
-        adur = min(dur_used, src_total - src_start) if dur_used > 0 else duration_of(f)
-        args = ["-f", "lavfi", "-i", f"color=black:size={W}x{H}:rate={fps:g}"] + \
-               seek + ["-i", str(f), "-map", "0:v", "-map", "1:a", "-t", f"{adur:.3f}"]
-    run_ffmpeg(args + ["-ar", "48000", "-ac", "2"] + enc + [str(norm)])
+    remaining = max(0.0, duration_of(f) - src_start)
+    length = dur_used if 0 < dur_used < remaining - 0.05 else remaining
+    if length < 0.05:
+        return None
 
+    # the clip's own internal cuts, in clip-local time (after srcStart)
+    keeps = None
     cuts = sorted([list(map(float, c)) for c in (ins.get("cuts") or [])])
-    if cuts and alpha:
-        print(f"overlay {ins.get('id')}: internal cuts aren't supported on "
-              f"transparent clips yet — playing it uncut", flush=True)
-        cuts = []
     if cuts:
-        ndur = duration_of(norm)
-        keeps, pos = [], 0.0
+        kk, pos = [], 0.0
         for ca, cb in cuts:
             if ca - pos > 0.05:
-                keeps.append((pos, min(ca, ndur)))
+                kk.append((pos, min(ca, length)))
             pos = max(pos, cb)
-        if ndur - pos > 0.05:
-            keeps.append((pos, ndur))
-        if keeps and keeps != [(0.0, ndur)]:
-            cut_file = tmpdir / f"ov{k}-cut.mp4"
-            cut_piece(norm, keeps, fps, quality, True, cut_file)
-            norm = cut_file
-    return norm, ox, oy
+        if length - pos > 0.05:
+            kk.append((pos, length))
+        keeps = snap_keeps(kk, fps)
+        if not keeps:
+            print(f"overlay {ins.get('id')}: every part of it is cut — skipped", flush=True)
+            return None
+    out_len = sum(b - a for a, b in keeps) if keeps else length
+
+    # ffmpeg's native vp9 decoder silently drops the alpha plane
+    dec = ["-c:v", "libvpx-vp9"] if alpha and f.suffix.lower() == ".webm" else []
+    seek = ["-ss", f"{src_start:.6f}"] if src_start > 0.01 else []
+    idx = g.input(dec + seek + ["-t", f"{length:.6f}", "-i", f])
+
+    if vs:
+        if frame:
+            fw = even(max(64, float(frame["w"]) * W))
+            chain = f"[{idx}:v]scale={fw}:-2"
+        else:
+            pad_color = ":color=black@0" if alpha else ""
+            chain = (f"[{idx}:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                     f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2{pad_color}")
+        chain += f",fps={rate},setsar=1" + (",format=yuva420p" if alpha else "")
+    else:
+        # audio-only clip: black picture under the sound, as in the editor
+        chain = f"color=c=black:s={W}x{H}:r={rate},trim=duration={length:.6f}"
+    if keeps:
+        half = 0.5 / fps
+        vsel = "+".join(f"between(t,{a - half:.5f},{b - half:.5f})" for a, b in keeps)
+        chain += f",select='{vsel}',setpts=N/FRAME_RATE/TB"
+    v = g.label("ov")
+    g.add(chain + f",setpts=PTS-STARTPTS+{ft:.6f}/TB{v}")
+
+    a = None
+    if has_audio(probe):
+        # footage of this same recording carries the same voice — clean it too
+        pre = denoise_for(f)
+        stem = f"[{idx}:a]"
+        if keeps:
+            stem = cut_audio(g, stem, keeps, 0.0, pre)
+            pre = None
+        a = g.label("oa")
+        delay = int(round(ft * 1000))
+        g.add(f"{stem}{pre + ',' if pre else ''}aresample=48000,{STEREO},"
+              f"adelay={delay}|{delay}{a}")
+    return v, a, ox, oy, out_len
 
 
 def eff_dur(ins):
@@ -226,6 +277,7 @@ def write_captions(cues, tr, W, H, tmpdir, to_output):
     maps a timeline position to a time in the finished file."""
     if not cues:
         return None
+    print("»stage captions", flush=True)
     timed = []
     prev_end = 0.0
     for c in sorted(cues, key=lambda i: float(i.get("at") or 0)):
@@ -269,47 +321,15 @@ def write_captions(cues, tr, W, H, tmpdir, to_output):
     return layer
 
 
-def caption_input(cap):
-    """ffmpeg input args for the transparent caption track."""
-    return ["-f", "concat", "-safe", "0", "-i", str(cap[0])]
-
-
-def burn_captions(src, cap, fps, quality, out):
-    """Standalone caption pass — used when nothing else touches the picture."""
-    graph = subtitles.overlay_filter(1, fps, "[0:v]", "[v]", cap[1])
-    run_ffmpeg(["-i", str(src)] + caption_input(cap)
-               + ["-filter_complex", graph, "-map", "[v]", "-map", "0:a?"]
-               + encode_args(quality) + [str(out)])
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("session_dir")
-    ap.add_argument("--input", default=None)
-    ap.add_argument("--output", default=None)
-    ap.add_argument("--quality", default="balanced", choices=["high", "balanced", "small"])
-    ap.add_argument("--compress", action="store_true",
-                    help="final visually-lossless H.265 pass to reduce file size")
-    ap.add_argument("--denoise", action="store_true",
-                    help="strip background noise from the voice (RNNoise), keep only the speaker")
-    ap.add_argument("--format", dest="fmt", default="wide",
-                    choices=["wide", "short", "square"])
-    ap.add_argument("--layout", default="cam-top",
-                    choices=["cam-top", "cam-bottom", "overlay"])
-    ap.add_argument("--range", nargs=2, type=float, default=None,
-                    metavar=("START", "END"))
-    args = ap.parse_args()
-
-    d = Path(args.session_dir)
-    tr_early = load_json(d / "transcript.json") or {}
+def prepare_source(d, args, tr):
+    """The recording to cut, and the file to write. Rebuilds the composite
+    when the webcam-bubble placement changed; builds the social reframe once."""
     if args.fmt == "wide":
         src = d / (args.input or "composite.mp4")
         out = d / (args.output or ("clean-part.mp4" if args.range else "clean.mp4"))
-        # rebuild the composite when the webcam-bubble keyframes changed
-        import json as _json
-        cam_segs = sorted([sg for sg in (tr_early.get("segments") or []) if sg.get("cam")],
+        cam_segs = sorted([sg for sg in (tr.get("segments") or []) if sg.get("cam")],
                           key=lambda sg: float(sg["s0"]))
-        want_layouts = _json.dumps(
+        want_layouts = json.dumps(
             [[round(float(sg["s0"]), 2), round(float(sg["s1"]), 2), sg["cam"]]
              for sg in cam_segs], sort_keys=True)
         sidecar = d / ".composite-layouts.json"
@@ -329,20 +349,48 @@ def main():
             subprocess.run([sys.executable, str(Path(__file__).parent / "reframe.py"),
                             str(d), "--format", args.fmt, "--layout", args.layout,
                             "--quality", args.quality], check=True)
+    return src, out
 
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("session_dir")
+    ap.add_argument("--input", default=None)
+    ap.add_argument("--output", default=None)
+    ap.add_argument("--quality", default="balanced", choices=["high", "balanced", "small"])
+    ap.add_argument("--compress", action="store_true",
+                    help="encode H.265 instead of H.264 (~30% smaller, same single pass)")
+    ap.add_argument("--denoise", action="store_true",
+                    help="strip background noise from the voice (RNNoise), keep only the speaker")
+    ap.add_argument("--format", dest="fmt", default="wide",
+                    choices=["wide", "short", "square"])
+    ap.add_argument("--layout", default="cam-top",
+                    choices=["cam-top", "cam-bottom", "overlay"])
+    ap.add_argument("--range", nargs=2, type=float, default=None,
+                    metavar=("START", "END"))
+    args = ap.parse_args()
+    exit_on_sigterm()
+
+    d = Path(args.session_dir)
     tr = load_json(d / "transcript.json")
     if not tr:
         sys.exit("no transcript.json — run transcribe first")
+    src, out = prepare_source(d, args, tr)
 
-    if getattr(args, "denoise", False):
-        src = _denoise_source(src)
-
+    info = ffprobe(src)
     dur = duration_of(src)
-    fps = probe_fps(src)
-    audio = has_audio(ffprobe(src))
-    vs = video_stream(ffprobe(src))
+    fps, rate = probe_rate(src)
+    a_st = next((s for s in info["streams"] if s["codec_type"] == "audio"), None)
+    audio = a_st is not None
+    mono = audio and int(a_st.get("channels", 2)) == 1
+    vs = video_stream(info)
     W, H = even(int(vs["width"])), even(int(vs["height"]))
     keeps_all = [(max(0.0, a), min(b, dur)) for a, b in keep_segments(tr) if a < dur]
+    pre = denoise_chain() if args.denoise else None
+    own_footage = {src.resolve(), (d / "composite.mp4").resolve()}
+
+    def denoise_for(f):
+        return pre if pre and f.resolve() in own_footage else None
 
     segments = sorted(tr.get("segments") or
                       [{"id": "seg1", "s0": 0.0, "s1": dur, "pos": 0.0}],
@@ -354,30 +402,75 @@ def main():
     caption_ins = [i for i in inserts_all if i.get("kind") == "subtitle"]
     overlays = [i for i in inserts_all
                 if i.get("kind") not in ("music", "subtitle")]
+    if pre:
+        print("removing background noise from the voice", flush=True)
 
-    # ---- partial render: just the selected slice, no arrangement ----
+    g = Graph()
+    tmp = tempfile.TemporaryDirectory(prefix="render-")
+    tmpdir = Path(tmp.name)
+
+    # ---- main track: footage pieces (and black gaps) in timeline order ----
+    seq = []             # (video, audio) labels to concatenate
+    blocks = []          # {arr0, arrLen, out0, kind, sg, keeps, effLen}
     if args.range:
+        # partial render: just the selected slice of the source, no arrangement
         r0, r1 = args.range
         keeps = intersect(keeps_all, r0, r1)
-        if not keeps:
+        segs = snap_keeps(keeps, fps)
+        if not segs:
             sys.exit("nothing kept inside the selected range")
-        n = cut_piece(src, keeps, fps, args.quality, audio, out)
-        rtmp = Path(tempfile.mkdtemp(prefix="caption-"))
+        seq.append(piece_streams(g, src, segs, fps, audio, mono, pre))
+        out_t = sum(b - a for a, b in segs)
+        overlays, music_ins = [], []
 
-        def range_time(c):
+        def to_output(c):
             t = arrangement_to_source(segments, c)
             return None if t is None else clean_time(t, keeps)
-        cap = write_captions(caption_ins, tr, W, H, rtmp, range_time)
-        if cap:
-            burned = rtmp / "burned.mp4"
-            burn_captions(out, cap, fps, args.quality, burned)
-            burned.replace(out)
-        _maybe_compress(out, args)
-        print(f"clean video: {out} ({n:.1f}s of selection)", flush=True)
-        return
-    # stack by track like the editor preview: the upper track (lower index) wins.
-    # overlays are composited in list order and the LAST one lands on top, so
-    # sort upper tracks LAST (track index descending), ties broken by position.
+    else:
+        cursor, out_t = 0.0, 0.0
+        for sg in segments:
+            raw_len = max(0.0, sg["s1"] - sg["s0"])
+            gap = sg["pos"] - cursor
+            if gap > 0.05:
+                frames = max(1, round(gap * fps))
+                seq.append(gap_streams(g, frames, fps, rate, W, H))
+                blocks.append({"arr0": cursor, "arrLen": gap, "out0": out_t, "kind": "gap"})
+                out_t += frames / fps
+            keeps = intersect(keeps_all, sg["s0"], sg["s1"])
+            segs = snap_keeps(keeps, fps)
+            eff = sum(b - a for a, b in segs)
+            if segs:
+                seq.append(piece_streams(g, src, segs, fps, audio, mono, pre))
+            blocks.append({"arr0": sg["pos"], "arrLen": raw_len, "out0": out_t,
+                           "kind": "piece", "sg": sg, "keeps": keeps, "effLen": eff})
+            out_t += eff
+            cursor = sg["pos"] + raw_len
+        if not any(b["kind"] == "piece" and b["effLen"] > 0 for b in blocks):
+            sys.exit("nothing left to render — every part of the recording is cut")
+
+        def to_output(c):
+            """Arrangement time -> output time (through cuts and gaps)."""
+            for b in blocks:
+                if c < b["arr0"]:
+                    return b["out0"]
+                if c < b["arr0"] + b["arrLen"]:
+                    if b["kind"] == "gap":
+                        return b["out0"] + (c - b["arr0"])
+                    t = b["sg"]["s0"] + (c - b["arr0"])
+                    off = sum(min(kb, t) - ka for ka, kb in b["keeps"] if ka < t)
+                    return b["out0"] + max(0.0, min(off, b["effLen"]))
+            return out_t
+
+    if len(seq) == 1:
+        bv, ba = seq[0]
+    else:
+        bv, ba = "[bv]", "[ba]"
+        g.add("".join(v + a for v, a in seq) + f"concat=n={len(seq)}:v=1:a=1{bv}{ba}")
+    base_dur = out_t
+
+    # ---- overlays, stacked like the editor preview: the upper track (lower
+    # index) wins. The LAST overlay composited lands on top, so upper tracks
+    # sort LAST (track index descending), ties broken by position ----
     track_ids = [t.get("id") for t in (tr.get("tracks") or [])]
 
     def _track_rank(ins):
@@ -386,155 +479,47 @@ def main():
         except ValueError:
             return 0
     overlays.sort(key=lambda i: (-_track_rank(i), i.get("at", 0)))
-
-    print("»stage cut", flush=True)
-    tmpdir = Path(tempfile.mkdtemp(prefix="arrange-"))
-    blocks = []          # {arr0, arrLen, out0, kind, sg, keeps, effLen}
-    files = []           # ordered files to concatenate
-    cursor, out_t = 0.0, 0.0
-    for k, sg in enumerate(segments):
-        raw_len = max(0.0, sg["s1"] - sg["s0"])
-        gap = sg["pos"] - cursor
-        if gap > 0.05:
-            gfile = tmpdir / f"gap{k}.mp4"
-            run_ffmpeg(["-f", "lavfi", "-i", f"color=black:size={W}x{H}:rate={fps:g}",
-                        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-                        "-t", f"{gap:.3f}"] + encode_args(args.quality) + [str(gfile)])
-            files.append(gfile)
-            blocks.append({"arr0": cursor, "arrLen": gap, "out0": out_t, "kind": "gap"})
-            out_t += gap
-        keeps = intersect(keeps_all, sg["s0"], sg["s1"])
-        pfile = tmpdir / f"piece{k}.mp4"
-        eff = cut_piece(src, keeps, fps, args.quality, audio, pfile) if keeps else 0.0
-        if eff > 0:
-            files.append(pfile)
-        blocks.append({"arr0": sg["pos"], "arrLen": raw_len, "out0": out_t,
-                       "kind": "piece", "sg": sg, "keeps": keeps, "effLen": eff})
-        out_t += eff
-        cursor = sg["pos"] + raw_len
-
-    # arrangement time -> output time (through cuts and gaps)
-    def final_time(c):
-        for b in blocks:
-            if c < b["arr0"]:
-                return b["out0"]
-            if c < b["arr0"] + b["arrLen"]:
-                if b["kind"] == "gap":
-                    return b["out0"] + (c - b["arr0"])
-                t = b["sg"]["s0"] + (c - b["arr0"])
-                off = sum(min(kb, t) - ka for ka, kb in b["keeps"] if ka < t)
-                return b["out0"] + max(0.0, min(off, b["effLen"]))
-        return out_t
-
-    # concat the arrangement
-    arranged = tmpdir / "arranged.mp4"
-    if len(files) == 1:
-        files[0].replace(arranged)
-    else:
-        ai = "aformat=sample_rates=48000:channel_layouts=stereo"
-        inputs, parts, pads = [], [], []
-        for k, f in enumerate(files):
-            inputs += ["-i", str(f)]
-            parts.append(f"[{k}:v]setpts=PTS-STARTPTS[v{k}]")
-            parts.append(f"[{k}:a]asetpts=PTS-STARTPTS,{ai}[a{k}]")
-            pads += [f"[v{k}]", f"[a{k}]"]
-        graph = ";".join(parts) + ";" + "".join(pads) + \
-                f"concat=n={len(files)}:v=1:a=1[v][a]"
-        run_ffmpeg(inputs + ["-filter_complex", graph, "-map", "[v]", "-map", "[a]"]
-                   + encode_args(args.quality) + [str(arranged)])
-
-    cap_file = write_captions(caption_ins, tr, W, H, tmpdir, final_time)
-
-    def finish_plain():
-        """Nothing left to composite or mix — captions (if any) are the only
-        thing still to draw on the arrangement."""
-        if cap_file:
-            print("»stage captions", flush=True)
-            burn_captions(arranged, cap_file, fps, args.quality, out)
-        else:
-            arranged.replace(out)
-        _maybe_compress(out, args)
-        print(f"clean video: {out} ({duration_of(out):.1f}s)", flush=True)
-
-    if not overlays and not music_ins:
-        finish_plain()
-        return
-
-    # ---- composite overlays ON TOP at their timeline positions ----
-    if overlays:
-        print(f"compositing {len(overlays)} overlay(s)", flush=True)
-    norm, times = [], []
-    for k, ins in enumerate(overlays):
-        res = normalize_overlay(d, ins, W, H, fps, args.quality, tmpdir, k)
+    placed = []
+    for ins in overlays:
+        ft = to_output(float(ins.get("at", 0)))
+        res = overlay_streams(g, d, ins, W, H, fps, rate, ft, denoise_for)
         if not res:
-            print(f"overlay {ins.get('id')}: file missing — skipped", flush=True)
+            if not resolve_insert(d, ins):
+                print(f"overlay {ins.get('id')}: file missing — skipped", flush=True)
             continue
-        nf, ox, oy = res
-        ft = final_time(float(ins.get("at", 0)))
-        norm.append((nf, ox, oy))
-        times.append((ft, duration_of(nf)))
+        placed.append((ft,) + res)
+    if placed:
+        print(f"compositing {len(placed)} overlay(s)", flush=True)
 
-    # ---- resolve music beds ----
-    mus = []
+    end_needed = max([base_dur] + [ft + ln for ft, _, _, _, _, ln in placed])
+    ext = end_needed - base_dur if end_needed - base_dur > 0.01 else 0.0
+    total_out = base_dur + ext
+
+    vprev = bv
+    if ext:
+        vprev = g.label("vx")
+        g.add(f"{bv}tpad=stop_duration={ext:.3f}:color=black{vprev}")
+        bpad = g.label("ax")
+        g.add(f"{ba}apad=pad_dur={ext:.3f}{bpad}")
+        ba = bpad
+    amix_pads = []
+    for ft, v, a, ox, oy, ln in placed:
+        nxt = g.label("vo")
+        g.add(f"{vprev}{v}overlay={ox}:{oy}:eof_action=pass"
+              f":enable='between(t,{ft:.3f},{ft + ln:.3f})'{nxt}")
+        vprev = nxt
+        if a:
+            amix_pads.append(a)
+
+    # ---- music beds: gain + fades + position, mixed together, then ducked
+    # under the voice (which doubles as the sidechain key) ----
+    mus_pads = []
     for m in music_ins:
         f = resolve_insert(d, m)
         if not f:
             print(f"music {m.get('musicTrack') or m.get('id')}: file missing — skipped", flush=True)
             continue
-        mus.append((f, m, final_time(float(m.get("at", 0)))))
-    if mus:
-        print(f"mixing {len(mus)} music bed(s), ducked under the voice", flush=True)
-
-    if not norm and not mus:
-        finish_plain()
-        return
-    print("»stage mix", flush=True)
-
-    base_dur = duration_of(arranged)
-    end_needed = max([base_dur] + [ft + fd for ft, fd in times])
-    ext = max(0.0, end_needed - base_dur)
-
-    total_out = max(base_dur + ext, base_dur)
-    # music-only pass leaves every pixel alone — copy the video stream
-    # instead of re-encoding (fast, no generation loss). Captions are drawn
-    # into the picture, so they rule that shortcut out.
-    video_untouched = not norm and ext <= 0.01 and not cap_file
-    inputs = ["-i", str(arranged)]
-    parts = []
-    vprev = "[bv]"
-    if not video_untouched:
-        parts.append(f"[0:v]tpad=stop_duration={ext:.3f}:color=black[bv]" if ext > 0.01
-                     else "[0:v]null[bv]")
-    # mono voice: upmix at unity (c0->both), NOT aformat's 0.707 pan-law —
-    # players duplicate mono at full level, so 0.707 would make every mixed
-    # render 3dB quieter than the plain one
-    a_st = next((s for s in ffprobe(arranged)["streams"]
-                 if s["codec_type"] == "audio"), None)
-    mono = a_st and int(a_st.get("channels", 2)) == 1
-    base_a = ("[0:a]" + ("pan=stereo|c0=c0|c1=c0," if mono else "")
-              + "aformat=sample_rates=48000:channel_layouts=stereo"
-              + (f",apad=pad_dur={ext:.3f}" if ext > 0.01 else ""))
-    if mus:
-        # the voice doubles as the sidechain key that ducks the music
-        parts.append(base_a + ",asplit=2[ba][sckey]")
-    else:
-        parts.append(base_a + "[ba]")
-    amix_pads = ["[ba]"]
-    for k, ((nf, ox, oy), (ft, fd)) in enumerate(zip(norm, times)):
-        inputs += ["-i", str(nf)]
-        parts.append(f"[{k + 1}:v]setpts=PTS+{ft:.3f}/TB[ov{k}]")
-        nxt = f"[vo{k}]"
-        parts.append(f"{vprev}[ov{k}]overlay={ox}:{oy}:eof_action=pass"
-                     f":enable='between(t,{ft:.3f},{ft + fd:.3f})'{nxt}")
-        vprev = nxt
-        delay = int(round(ft * 1000))
-        parts.append(f"[{k + 1}:a]adelay={delay}|{delay},"
-                     f"aformat=sample_rates=48000:channel_layouts=stereo[oa{k}]")
-        amix_pads.append(f"[oa{k}]")
-
-    # ---- music beds: gain + fades + position, mixed together, then ducked ----
-    mus_pads = []
-    for k, (f, m, ft) in enumerate(mus):
+        ft = to_output(float(m.get("at", 0)))
         if m.get("loop"):
             cl = max(0.0, total_out - ft)               # looped: always to the end
         else:
@@ -542,61 +527,61 @@ def main():
             cl = min(cl, max(0.0, total_out - ft))      # never outlast the video
         if cl < 0.1:
             continue
-        idx = 1 + len(norm) + len(mus_pads)
-        seek = []
         ss = float(m.get("srcStart") or 0)
-        if ss > 0.01:
-            seek = ["-ss", f"{ss:.3f}"]
-        if m.get("loop"):
-            inputs += ["-stream_loop", "-1"]   # atrim below caps the length
-        inputs += seek + ["-i", str(f)]
+        idx = g.input((["-stream_loop", "-1"] if m.get("loop") else [])   # atrim caps it
+                      + (["-ss", f"{ss:.3f}"] if ss > 0.01 else []) + ["-i", f])
         # volume: linear fraction (editor's % slider); older clips stored dB
         vol = m.get("volume")
         vol = float(vol) if vol is not None else 10 ** (float(m.get("gain", -21)) / 20)
         vol = max(0.0, min(1.5, vol))
         delay = int(round(ft * 1000))
-        fade_out = max(0.0, cl - 2.5)
-        parts.append(f"[{idx}:a]atrim=0:{cl:.3f},volume={vol:.4f},"
-                     f"afade=t=in:d=1.5,afade=t=out:st={fade_out:.2f}:d=2.5,"
-                     f"adelay={delay}|{delay},"
-                     f"aformat=sample_rates=48000:channel_layouts=stereo[mu{len(mus_pads)}]")
-        mus_pads.append(f"[mu{len(mus_pads)}]")
+        lab = g.label("mu")
+        g.add(f"[{idx}:a]atrim=0:{cl:.3f},volume={vol:.4f},"
+              f"afade=t=in:d=1.5,afade=t=out:st={max(0.0, cl - 2.5):.2f}:d=2.5,"
+              f"adelay={delay}|{delay},{STEREO}{lab}")
+        mus_pads.append(lab)
     if mus_pads:
+        print(f"mixing {len(mus_pads)} music bed(s), ducked under the voice", flush=True)
         if len(mus_pads) > 1:
-            parts.append("".join(mus_pads) +
-                         f"amix=inputs={len(mus_pads)}:duration=longest:dropout_transition=0:normalize=0[muall]")
-            music_lbl = "[muall]"
+            music = g.label("muall")
+            g.add("".join(mus_pads) + f"amix=inputs={len(mus_pads)}:duration=longest"
+                  f":dropout_transition=0:normalize=0{music}")
         else:
-            music_lbl = mus_pads[0]
-        parts.append(f"{music_lbl}[sckey]sidechaincompress=threshold=0.02:ratio=12"
-                     f":attack=80:release=800:makeup=1[mduck]")
-        amix_pads.append("[mduck]")
-    elif mus:
-        # every bed fell outside the video — drop the unused sidechain key
-        parts.append("[sckey]anullsink")
-    # captions land last, on top of everything that was composited. The layer
-    # is the final input so the overlay/music indices above stay put.
-    if cap_file:
-        inputs += caption_input(cap_file)
-        parts.append(subtitles.overlay_filter(
-            1 + len(norm) + len(mus_pads), fps, vprev, "[vcap]", cap_file[1]))
+            music = mus_pads[0]
+        voice, key = g.label("voice"), g.label("sckey")
+        g.add(f"{ba}asplit=2{voice}{key}")
+        ducked = g.label("mduck")
+        g.add(f"{music}{key}sidechaincompress=threshold=0.02:ratio=12"
+              f":attack=80:release=800:makeup=1{ducked}")
+        ba = voice
+        amix_pads.append(ducked)
+
+    # ---- captions land last, on top of everything that was composited ----
+    cap = write_captions(caption_ins, tr, W, H, tmpdir, to_output)
+    if cap:
+        idx = g.input(["-f", "concat", "-safe", "0", "-i", cap[0]])
+        g.add(subtitles.overlay_filter(idx, fps, vprev, "[vcap]", cap[1]))
         vprev = "[vcap]"
-    # dropout_transition=0: the default 2s end-of-stream ramp renormalizes the
-    # whole mix ~3dB down when a delayed/trimmed input ends — kills the fix
-    parts.append("".join(amix_pads) +
-                 f"amix=inputs={len(amix_pads)}:duration=longest:dropout_transition=0:normalize=0[a]")
-    graph = ";".join(parts)
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
-        f.write(graph)
-        script = f.name
-    if video_untouched:
-        maps = ["-map", "0:v", "-map", "[a]"]
-        enc = ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
-    else:
-        maps = ["-map", vprev.strip("[]").join(["[", "]"]), "-map", "[a]"]
-        enc = encode_args(args.quality)
-    run_ffmpeg(inputs + ["-filter_complex_script", script] + maps + enc + [str(out)])
-    _maybe_compress(out, args)
+
+    if amix_pads:
+        # dropout_transition=0: the default 2s end-of-stream ramp renormalizes
+        # the whole mix ~3dB down when a delayed/trimmed input ends
+        g.add(f"{ba}{''.join(amix_pads)}amix=inputs={len(amix_pads) + 1}"
+              f":duration=longest:dropout_transition=0:normalize=0[aout]")
+        ba = "[aout]"
+
+    script = tmpdir / "graph.txt"
+    script.write_text(";".join(g.parts))
+    print("»stage render", flush=True)
+    if args.compress:
+        print("encoding as H.265 to save space", flush=True)
+    try:
+        # a failed or cancelled render must not destroy the previous good one
+        build_then_swap(out, lambda part: run_ffmpeg(
+            g.args() + ["-filter_complex_script", str(script), "-map", vprev, "-map", ba]
+            + encode_args(args.quality, hevc=args.compress) + [str(part)]))
+    finally:
+        tmp.cleanup()
     print(f"clean video: {out} ({duration_of(out):.1f}s)", flush=True)
 
 
