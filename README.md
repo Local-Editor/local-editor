@@ -37,8 +37,8 @@ Optional background-music starter pack (CC-BY, from Incompetech):
 .venv/bin/python3 scripts/music.py starter
 ```
 
-Notes: the Whisper `small` model (~500MB) auto-downloads on your first
-transcription. Encoding uses the Mac hardware encoder when available and falls
+Notes: the Whisper `large-v3-turbo` model (~1.6GB) auto-downloads on your
+first transcription. Encoding uses the Mac hardware encoder when available and falls
 back to libx264 elsewhere. The server binds to localhost only (`PORT`/`HOST`
 env vars override).
 
@@ -212,8 +212,8 @@ The `screen-studio` skill runs the whole pipeline from the terminal — e.g.
 "clean up my latest screen recording", "tighten it, remove the umms, render".
 Claude also does a deeper semantic clean-up pass (rambling, reworded retakes).
 
-Whisper models: `small` is the default; `large-v3-turbo` is installed for
-maximum accuracy (catches more umms + missed words).
+Whisper models: `large-v3-turbo` is the default (catches more umms + missed
+words); `--model small` is faster and less accurate.
 
 ## Layout on disk
 

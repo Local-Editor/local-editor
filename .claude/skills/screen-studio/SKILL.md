@@ -43,8 +43,8 @@ Recorder at `/`, transcript editing dashboard at `/editor.html`.
 **Full pipeline on a session (transcribe + composite → auto-clean → render):**
 ```bash
 PY="$STUDIO/.venv/bin/python3"; S="$STUDIO/recordings/<session>"
-"$PY" "$STUDIO/scripts/process.py"    "$S" --model small  # transcribe + build composite.mp4 side by side
-# (default model; large-v3-turbo = best, ~1.6GB download). Either half also runs
+"$PY" "$STUDIO/scripts/process.py"    "$S"  # transcribe + build composite.mp4 side by side
+# (default model large-v3-turbo, ~1.6GB download; --model small is faster). Either half also runs
 # alone: composite.py <session> / transcribe.py <session> --model …
 # transcribe primes Whisper to keep umms verbatim, and inserts "(um?)" markers
 # (detected:true) for audible gap sounds Whisper refused to write — enhance.py
@@ -101,10 +101,11 @@ tracks require it; Pixabay/user tracks imported via `music.py add` may not).
 
 ## Whisper models
 
-`small` is the default (auto-downloads on first transcription). Use
-`large-v3-turbo` for maximum accuracy (catches more umms + missed words):
-`transcribe.py <session> --model large-v3-turbo` (~1.6GB download, slower on
-CPU, worth it for recordings that matter).
+`large-v3-turbo` is the default (~1.6GB, auto-downloads on first
+transcription; ~50s for a 4-min take on CPU). It replaced `small` on
+2026-10-13: on a real 4-min take `small` invented ~35s of text over loud,
+clear speech (it looped the verbatim prompt). `--model small` is still there
+if speed matters more than accuracy.
 
 ## Rules
 

@@ -551,7 +551,7 @@ const server = http.createServer(async (req, res) => {
     // after a recording: transcription and the composite run side by side
     if (p === '/api/process' && req.method === 'POST') {
       const id = safeSession(url.searchParams.get('session'));
-      const model = url.searchParams.get('model') || 'small';
+      const model = url.searchParams.get('model') || 'large-v3-turbo';
       if (!/^(tiny|base|small|medium|large-v[23](-turbo)?|distil-[\w.-]+)$/.test(model)) {
         return json(res, 400, { error: 'bad model name' });
       }
@@ -561,7 +561,7 @@ const server = http.createServer(async (req, res) => {
 
     if (p === '/api/transcribe' && req.method === 'POST') {
       const id = safeSession(url.searchParams.get('session'));
-      const model = url.searchParams.get('model') || 'small';
+      const model = url.searchParams.get('model') || 'large-v3-turbo';
       if (!/^(tiny|base|small|medium|large-v[23](-turbo)?|distil-[\w.-]+)$/.test(model)) {
         return json(res, 400, { error: 'bad model name' });
       }

@@ -4,7 +4,7 @@
 Prefers the webcam file (clean mic audio) over the composite. Word-level
 timestamps so the editor can cut at word granularity.
 
-Usage: transcribe.py <session-dir> [--model base|small|medium] [--language en]
+Usage: transcribe.py <session-dir> [--model large-v3-turbo|small|base] [--language en]
 """
 import argparse
 import json
@@ -144,8 +144,8 @@ def pick_audio_source(d: Path, meta: dict):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("session_dir")
-    ap.add_argument("--model", default="small",
-                    help="base | small | medium | large-v3-turbo (better & slower)")
+    ap.add_argument("--model", default="large-v3-turbo",
+                    help="large-v3-turbo | medium | small | base (faster, less accurate)")
     ap.add_argument("--language", default=None)
     args = ap.parse_args()
 

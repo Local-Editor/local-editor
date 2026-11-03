@@ -40,7 +40,7 @@ rclone config            # user does this — add a Drive remote named "gdrive"
 ```
 
 Notes:
-- The Whisper model (~500MB for `small`) auto-downloads on the first
+- The Whisper model (~1.6GB for `large-v3-turbo`) auto-downloads on the first
   transcription — warn the user the first run is slow.
 - Encoding uses macOS VideoToolbox when available and falls back to libx264
   everywhere else; nothing to configure.

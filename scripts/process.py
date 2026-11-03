@@ -8,7 +8,7 @@ is mostly the hardware encoder, so running them side by side has the
 transcript ready in about the time transcription alone takes — instead of
 after the composite AND the transcription.
 
-Usage: process.py <session-dir> [--model small]
+Usage: process.py <session-dir> [--model large-v3-turbo]
 """
 import argparse
 import subprocess
@@ -22,7 +22,7 @@ from common import exit_on_sigterm
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("session_dir")
-    ap.add_argument("--model", default="small")
+    ap.add_argument("--model", default="large-v3-turbo")
     args = ap.parse_args()
     exit_on_sigterm()   # cancel SIGTERMs the whole group: both children stop too
 
